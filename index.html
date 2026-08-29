@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Buscador en videos de YouTube</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --fondo: #f6f6f7;
+    --tarjeta: #ffffff;
+    --texto: #1a1a1c;
+    --tenue: #6b6b73;
+    --borde: #dededf;
+    --acento: #c8102e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fondo: #17171a;
+      --tarjeta: #1f1f23;
+      --texto: #ececee;
+      --tenue: #9a9aa3;
+      --borde: #34343a;
+      --acento: #ff5a72;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 2rem 1rem 4rem;
+    background: var(--fondo);
+    color: var(--texto);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 44rem; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
+  .sub { color: var(--tenue); margin: 0 0 2rem; font-size: .95rem; }
+  form { display: grid; gap: .75rem; }
+  .fila { display: flex; gap: .75rem; }
+  .fila input { flex: 1; }
+  input {
+    width: 100%;
+    padding: .7rem .85rem;
+    font-size: 1rem;
+    color: var(--texto);
+    background: var(--tarjeta);
+    border: 1px solid var(--borde);
+    border-radius: .5rem;
+  }
+  input:focus { outline: 2px solid var(--acento); outline-offset: 1px; }
+  button {
+    padding: .7rem 1.4rem;
+    font-size: 1rem;
+    font-weight: 600;
+    color: #fff;
+    background: var(--acento);
+    border: 0;
+    border-radius: .5rem;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .55; cursor: default; }
+  #estado { margin: 1.5rem 0 0; color: var(--tenue); }
+  #estado.error { color: var(--acento); }
+  #titulo { margin: 1.75rem 0 .75rem; font-size: .9rem; color: var(--tenue); }
+  ol { list-style: none; margin: 0; padding: 0; display: grid; gap: .5rem; }
+  a.resultado {
+    display: grid;
+    grid-template-columns: 5rem 1fr;
+    gap: .75rem;
+    align-items: baseline;
+    padding: .85rem 1rem;
+    background: var(--tarjeta);
+    border: 1px solid var(--borde);
+    border-radius: .5rem;
+    text-decoration: none;
+    color: inherit;
+  }
+  a.resultado:hover { border-color: var(--acento); }
+  .marca {
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    color: var(--acento);
+  }
+  .cita { color: var(--texto); }
+  label.opcion {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    color: var(--tenue);
+    font-size: .9rem;
+  }
+  label.opcion input { width: auto; padding: 0; }
+  @media (max-width: 30rem) {
+    a.resultado { grid-template-columns: 1fr; gap: .3rem; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>¿En qué minuto lo dijeron?</h1>
+  <p class="sub">Pegá el link de un video de YouTube y buscá una palabra o una frase.</p>
+
+  <form id="form">
+    <input id="url" type="url" required placeholder="https://www.youtube.com/watch?v=..."
+           autocomplete="off" spellcheck="false">
+    <div class="fila">
+      <input id="consulta" type="text" required placeholder="palabra o frase a buscar"
+             autocomplete="off">
+      <button id="boton" type="submit">Buscar</button>
+    </div>
+    <label class="opcion">
+      <input id="forzar_whisper" type="checkbox">
+      Transcribir el audio con IA (WhisperX) — más lento, pero encuentra nombres propios
+      y marca el segundo exacto
+    </label>
+  </form>
+
+  <p id="estado"></p>
+  <p id="titulo" hidden></p>
+  <ol id="resultados"></ol>
+</main>
+
+<script>
+  const form = document.getElementById("form");
+  const boton = document.getElementById("boton");
+  const estado = document.getElementById("estado");
+  const titulo = document.getElementById("titulo");
+  const lista = document.getElementById("resultados");
+  const forzar = document.getElementById("forzar_whisper");
+
+  // La primera busqueda de un video baja el texto; las siguientes salen del cache.
+  const vistos = new Set();
+
+  function cronometro(mensaje) {
+    const arranque = Date.now();
+    const pintar = () => {
+      const seg = Math.floor((Date.now() - arranque) / 1000);
+      const mm = Math.floor(seg / 60);
+      const ss = String(seg % 60).padStart(2, "0");
+      estado.textContent = `${mensaje} (${mm}:${ss})`;
+    };
+    pintar();
+    return setInterval(pintar, 1000);
+  }
+
+  form.addEventListener("submit", async (evento) => {
+    evento.preventDefault();
+    const url = document.getElementById("url").value.trim();
+    const consulta = document.getElementById("consulta").value.trim();
+    const forzarWhisper = forzar.checked;
+    const clave = url + (forzarWhisper ? "|ia" : "|subs");
+
+    lista.replaceChildren();
+    titulo.hidden = true;
+    estado.className = "";
+    boton.disabled = true;
+
+    // Transcribir baja el audio entero y lo pasa por el modelo: son minutos, no segundos.
+    let tic = null;
+    if (vistos.has(clave)) {
+      estado.textContent = "Buscando…";
+    } else if (forzarWhisper) {
+      tic = cronometro("Transcribiendo el audio con IA, esto tarda varios minutos…");
+    } else {
+      estado.textContent = "Bajando los subtítulos, puede tardar unos segundos…";
+    }
+
+    try {
+      const respuesta = await fetch("/api/buscar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url,
+          consulta,
+          forzar_whisper: forzarWhisper,
+        }),
+      });
+      const datos = await respuesta.json();
+      if (!respuesta.ok) throw new Error(datos.error || "Algo falló.");
+
+      clearInterval(tic);
+      tic = null;
+      vistos.add(clave);
+      titulo.textContent = datos.fuente === "whisperx"
+        ? `${datos.titulo} — transcripción con IA`
+        : datos.titulo;
+      titulo.hidden = false;
+
+      if (!datos.resultados.length) {
+        estado.textContent = `No aparece “${consulta}” en este video.`;
+        return;
+      }
+
+      const cantidad = datos.resultados.length;
+      const aproximado = datos.resultados.some((item) => item.aproximado);
+      estado.textContent = aproximado
+        ? `No aparece “${consulta}” tal cual, pero sí algo muy parecido ` +
+          `(${cantidad} ${cantidad === 1 ? "resultado" : "resultados"}):`
+        : `${cantidad} ${cantidad === 1 ? "resultado" : "resultados"}:`;
+
+      for (const item of datos.resultados) {
+        const enlace = document.createElement("a");
+        enlace.className = "resultado";
+        enlace.href = item.link;
+        enlace.target = "_blank";
+        enlace.rel = "noopener";
+
+        const marca = document.createElement("span");
+        marca.className = "marca";
+        marca.textContent = item.timestamp;
+
+        const cita = document.createElement("span");
+        cita.className = "cita";
+        cita.textContent = item.texto;
+
+        enlace.append(marca, cita);
+        const fila = document.createElement("li");
+        fila.append(enlace);
+        lista.append(fila);
+      }
+    } catch (error) {
+      estado.className = "error";
+      estado.textContent = error.message;
+    } finally {
+      clearInterval(tic);
+      boton.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
