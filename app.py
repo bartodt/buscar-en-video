@@ -1,47 +1,175 @@
 #!/usr/bin/env python3
 """Servidor local para buscar palabras dentro de los subtitulos de un video de YouTube."""
 
+import html
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unicodedata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 RAIZ = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.expanduser("~/.cache/buscar-en-video")
-PUERTO = 8765
+PUERTO = int(os.environ.get("BUSCAR_PUERTO") or 8765)
+ORIGENES = ("http://127.0.0.1:%d" % PUERTO, "http://localhost:%d" % PUERTO)
+
+# El idioma sale de aca y de ningun otro lado: antes estaba escrito por separado en
+# el --sub-langs de yt-dlp, en la preferencia de pistas y en el --language de
+# whisperx, y los tres se podian desincronizar.
+IDIOMA = os.environ.get("BUSCAR_IDIOMA") or "es"
 
 # Los subtitulos automaticos repiten cada linea mientras rota en pantalla; dos cues
 # identicos dentro de esta ventana son la misma frase dicha una sola vez.
 VENTANA_DUPLICADOS = 10
+# Una linea solo se fusiona con la anterior si la sigue de cerca. Sin esta ventana un
+# "sí" del minuto 0 se comia un "sí, claro que sí" del minuto 5: quedaba una sola
+# entrada con el timestamp viejo y la mencion tardia desaparecia del indice.
+VENTANA_FUSION = 8
 CONTEXTO = 60
+# Una consulta de una o dos letras matchea decenas de miles de veces en un video
+# largo: sin tope el JSON pesa megabytes y el navegador se cuelga armando el DOM.
+MAX_RESULTADOS = 200
+
+# Al mostrar la transcripcion entera el texto se corta en bloques con su timestamp.
+# Los cues son por palabra: uno por linea seria ilegible.
+LARGO_BLOQUE = 240
+SEGUNDOS_BLOQUE = 30
+
+# El .vtt se guarda crudo, asi que cambiar el parseo no lo invalida. Expira por otra
+# razon: un video puede ganar subtitulos reales despues de haber tenido solo
+# automaticos, y sin vencimiento nunca nos enterariamos.
+TTL_CACHE_VTT = 30 * 24 * 3600
 
 # Transcripcion con IA. Medido sobre 5 min del mismo audio, comparando contra los
 # subtitulos de YouTube: turbo coincide 88.3%, large-v3 87.9%, medium 84.3% y small
 # 81.9%. turbo gana en calidad y ademas es el mas rapido de los tres grandes (2:46
 # contra 8:10 de large-v3), asi que no hay razon para usar otro en CPU.
-MODELO_WHISPER = "large-v3-turbo"
-IDIOMA_WHISPER = "es"
-VERSION_CACHE_WHISPER = 2
+MODELO_WHISPER = os.environ.get("BUSCAR_MODELO") or "large-v3-turbo"
+# v3 guarda tambien la transcripcion cruda de whisperx: si cambia como se arman los
+# cues se rehacen gratis, en vez de volver a transcribir el audio durante horas.
+VERSION_CACHE_WHISPER = 3
 
 
 class ErrorDeUso(Exception):
     """Error con un mensaje pensado para mostrarle al usuario tal cual."""
 
 
+# --- procesos externos -----------------------------------------------------
+
+_HIJOS = set()
+_LOCK_HIJOS = threading.Lock()
+
+
+def _correr(comando, timeout, mensaje_timeout, mostrar_salida=False):
+    """subprocess.run, pero con el hijo anotado para poder matarlo al salir.
+
+    Sin el registro, cerrar la ventana mata al servidor y deja a whisperx
+    transcribiendo al 100% de CPU hasta una hora, sin ventana que lo delate.
+    Con mostrar_salida el stdout del hijo va a la terminal en vez de juntarse en
+    memoria: es como se ve el progreso de una transcripcion larga.
+    """
+    proceso = subprocess.Popen(
+        comando,
+        stdout=None if mostrar_salida else subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    with _LOCK_HIJOS:
+        _HIJOS.add(proceso)
+    try:
+        salida, error = proceso.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proceso.kill()
+        proceso.communicate()
+        raise ErrorDeUso(mensaje_timeout) from None
+    finally:
+        with _LOCK_HIJOS:
+            _HIJOS.discard(proceso)
+    return proceso.returncode, salida or "", error or ""
+
+
+def _terminar_hijos():
+    with _LOCK_HIJOS:
+        hijos = list(_HIJOS)
+    for proceso in hijos:
+        proceso.kill()
+
+
+def _matar_hijos(*_args):
+    """Handler de SIGTERM/SIGHUP. start.command cuenta con esto para no dejar huerfanos."""
+    _terminar_hijos()
+    sys.exit(0)
+
+
+def _exigir(binario, arreglo):
+    if not shutil.which(binario):
+        raise ErrorDeUso(
+            "Falta instalar %s. Abrí la Terminal y corré:  %s" % (binario, arreglo)
+        )
+
+
+# --- cache -----------------------------------------------------------------
+
+_CANDADOS = {}
+_LOCK_CANDADOS = threading.Lock()
+
+
+def _candado(clave):
+    """Un candado por video: dos pestañas sobre el mismo link no lo bajan dos veces.
+
+    Importa sobre todo en el modo IA: dos whisperx simultaneos, cada uno pidiendo
+    todos los cores, dejan la maquina inusable y encima se pisan el archivo final.
+    """
+    with _LOCK_CANDADOS:
+        return _CANDADOS.setdefault(clave, threading.Lock())
+
+
+def _ruta_cache(nombre):
+    return os.path.join(CACHE, nombre)
+
+
+def _guardar_cache(nombre, texto):
+    """Escribe a un temporal y renombra: un corte a mitad no deja un archivo trunco.
+
+    os.replace es atomico dentro del mismo filesystem. Sin esto, un Ctrl+C durante la
+    escritura dejaba medio .vtt en el cache y se servia como bueno para siempre.
+    """
+    os.makedirs(CACHE, exist_ok=True)
+    ruta = _ruta_cache(nombre)
+    parcial = ruta + ".parcial"
+    with open(parcial, "w", encoding="utf-8") as fh:
+        fh.write(texto)
+    os.replace(parcial, ruta)
+
+
 # --- normalizacion ---------------------------------------------------------
 
+# La tabla se arma una vez por caracter visto y despues str.translate hace el trabajo
+# en C: sobre un transcript de 3 h son 3 ms en vez de 27.
+_TABLA_NORM = {}
+_NORM_CONOCIDOS = set()
+
+
 def normalizar(texto):
-    """Minusculas y sin tildes, preservando la longitud para no romper los offsets."""
-    salida = []
-    for c in texto:
+    """Minusculas y sin tildes, preservando la longitud para no romper los offsets.
+
+    La "ñ" tambien se descompone en "n", a proposito: es lo que hace que buscar
+    "senuk" encuentre "Señuk" sin tener que saber donde esta la ñ en el teclado. El
+    precio es que "año" tambien matchea "ano", y esta bien pagarlo.
+    """
+    nuevos = set(texto).difference(_NORM_CONOCIDOS)
+    for c in nuevos:
         base = unicodedata.normalize("NFD", c)[0].lower()
-        salida.append(base if len(base) == 1 else c)
-    return "".join(salida)
+        _TABLA_NORM[ord(c)] = base if len(base) == 1 else c
+        _NORM_CONOCIDOS.add(c)
+    return texto.translate(_TABLA_NORM)
 
 
 # --- yt-dlp ----------------------------------------------------------------
@@ -49,8 +177,10 @@ def normalizar(texto):
 def extraer_id(url):
     url = (url or "").strip()
     patrones = (
-        r"(?:youtube\.com|youtube-nocookie\.com)/(?:watch\?(?:.*&)?v=|embed/|shorts/|live/|v/)([A-Za-z0-9_-]{11})",
-        r"youtu\.be/([A-Za-z0-9_-]{11})",
+        # El (?!...) del final evita que un id de 12 caracteres matchee los primeros
+        # 11 y termine buscando, en silencio, dentro de otro video.
+        r"(?:youtube\.com|youtube-nocookie\.com)/(?:watch\?(?:.*&)?v=|embed/|shorts/|live/|v/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])",
+        r"youtu\.be/([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])",
         r"^([A-Za-z0-9_-]{11})$",
     )
     for patron in patrones:
@@ -60,20 +190,30 @@ def extraer_id(url):
     raise ErrorDeUso("Ese link no parece un video de YouTube. Pegá la URL completa.")
 
 
-def _leer_cache(video_id):
-    vtt = os.path.join(CACHE, video_id + ".vtt")
+def _leer_cache(video_id, ignorar_ttl=False):
+    vtt = _ruta_cache(video_id + ".vtt")
     if not os.path.exists(vtt):
         return None
-    titulo_path = os.path.join(CACHE, video_id + ".titulo")
+    if not ignorar_ttl and time.time() - os.path.getmtime(vtt) > TTL_CACHE_VTT:
+        return None
+    try:
+        with open(vtt, encoding="utf-8") as fh:
+            contenido = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not contenido.strip():
+        return None
     titulo = video_id
-    if os.path.exists(titulo_path):
-        with open(titulo_path, encoding="utf-8") as fh:
+    try:
+        with open(_ruta_cache(video_id + ".titulo"), encoding="utf-8") as fh:
             titulo = fh.read().strip() or video_id
-    with open(vtt, encoding="utf-8") as fh:
-        return fh.read(), titulo
+    except (OSError, UnicodeDecodeError):
+        pass
+    return contenido, titulo
 
 
-def _diagnosticar_fallo(salida):
+def _diagnosticar_fallo(salida, que="los subtítulos"):
+    """Traduce el stderr de yt-dlp al castellano. Siempre termina lanzando."""
     texto = salida.lower()
     if "429" in texto or "too many requests" in texto:
         raise ErrorDeUso(
@@ -86,20 +226,40 @@ def _diagnosticar_fallo(salida):
         )
     if "video unavailable" in texto or "private video" in texto:
         raise ErrorDeUso("Ese video no está disponible (es privado o fue dado de baja).")
-    raise ErrorDeUso("No se pudieron bajar los subtítulos de ese video.")
+    # Es lo que arregla la enorme mayoria de los casos: YouTube cambia y yt-dlp se
+    # queda viejo. Decirlo evita el "no anda mas" sin pista de por donde empezar.
+    raise ErrorDeUso(
+        "No se pudieron bajar %s de ese video. Si esto empezó de un día para el "
+        "otro suele ser yt-dlp desactualizado: abrí la Terminal y corré  "
+        "brew upgrade yt-dlp" % que
+    )
 
 
-# Los videos que buscamos son siempre en español, asi que solo pedimos esa pista.
-# YouTube ofrece autosubs traducidos a cualquier idioma, pero solo "es-orig" es la
-# transcripcion real del audio: "es" a secas puede ser una traduccion de la traduccion
-# al ingles, con palabras cambiadas respecto de lo que se dice de verdad.
-PREFERENCIA_SUBS = ("es-orig", "es")
+# Pedimos una sola pista, la del idioma configurado. YouTube ofrece autosubs
+# traducidos a cualquier idioma, pero solo la variante "-orig" es la transcripcion
+# real del audio: "es" a secas puede ser una traduccion de la traduccion al ingles,
+# con palabras cambiadas respecto de lo que se dice de verdad.
+PREFERENCIA_SUBS = (IDIOMA + "-orig", IDIOMA)
+NOMBRE_IDIOMA = {"es": "español", "en": "inglés", "pt": "portugués"}.get(IDIOMA, IDIOMA)
+URL_VIDEO = "https://www.youtube.com/watch?v=%s"
 
 
 def _idioma_de(archivo, video_id):
-    """El nombre quedo como "<titulo> [<id>].<lang>.vtt"."""
-    partes = archivo.split(" [" + video_id + "].")
-    return partes[-1][:-4] if len(partes) > 1 else ""
+    """Con -o "%(id)s.%(ext)s" los subtitulos quedan como "<id>.<lang>.vtt"."""
+    return archivo[len(video_id) + 1:-len(".vtt")]
+
+
+def _titulo_de_info(tmp, base, respaldo):
+    """El titulo real, del .info.json que yt-dlp deja junto a lo que bajo.
+
+    Reconstruirlo del nombre del archivo daba la version saneada por yt-dlp: las
+    barras cambiadas por otro caracter y el nombre recortado a 255 bytes.
+    """
+    try:
+        with open(os.path.join(tmp, base + ".info.json"), encoding="utf-8") as fh:
+            return (json.load(fh).get("title") or "").strip() or respaldo
+    except (ValueError, OSError):
+        return respaldo
 
 
 def _elegir_sub(archivos, video_id):
@@ -116,50 +276,61 @@ def bajar_subs(video_id):
     if cacheado:
         return cacheado
 
-    if not shutil.which("yt-dlp"):
-        raise ErrorDeUso(
-            "Falta instalar yt-dlp. Abrí la Terminal y corré:  brew install yt-dlp"
-        )
+    _exigir("yt-dlp", "brew install yt-dlp")
 
+    with _candado("subs:" + video_id):
+        # Otro pedido del mismo video pudo haberlo bajado mientras esperabamos.
+        cacheado = _leer_cache(video_id)
+        if cacheado:
+            return cacheado
+        try:
+            return _bajar_subs(video_id)
+        except ErrorDeUso:
+            # Un cache vencido sigue siendo mejor que nada: si YouTube no responde o
+            # no hay red, se busca sobre lo viejo antes que dejar al usuario a pie.
+            vencido = _leer_cache(video_id, ignorar_ttl=True)
+            if vencido:
+                print("Aviso: no pude refrescar %s, uso los subtítulos guardados."
+                      % video_id, file=sys.stderr)
+                return vencido
+            raise
+
+
+def _bajar_subs(video_id):
     with tempfile.TemporaryDirectory() as tmp:
         comando = [
             "yt-dlp",
             "--skip-download",
             "--write-subs",
             "--write-auto-subs",
-            "--sub-langs", "es.*",
+            "--sub-langs", IDIOMA + ".*",
             "--sub-format", "vtt",
+            "--write-info-json",
             "--no-playlist",
             "--no-warnings",
-            "-o", os.path.join(tmp, "%(title)s [%(id)s].%(ext)s"),
-            "https://www.youtube.com/watch?v=" + video_id,
+            "-o", os.path.join(tmp, "%(id)s.%(ext)s"),
+            URL_VIDEO % video_id,
         ]
-        try:
-            proceso = subprocess.run(
-                comando, capture_output=True, text=True, timeout=180
-            )
-        except subprocess.TimeoutExpired:
-            raise ErrorDeUso("YouTube tardó demasiado en responder. Probá de nuevo.")
+        codigo, salida, error = _correr(
+            comando, 180, "YouTube tardó demasiado en responder. Probá de nuevo."
+        )
 
         archivos = sorted(f for f in os.listdir(tmp) if f.endswith(".vtt"))
         if not archivos:
-            if proceso.returncode != 0:
-                _diagnosticar_fallo(proceso.stderr + proceso.stdout)
+            if codigo != 0:
+                _diagnosticar_fallo(error + salida)
             raise ErrorDeUso(
-                "Ese video no tiene subtítulos en español, ni siquiera automáticos, "
-                "así que no hay texto donde buscar."
+                "Ese video no tiene subtítulos en %s, ni siquiera automáticos, "
+                "así que no hay texto donde buscar." % NOMBRE_IDIOMA
             )
 
         elegido = _elegir_sub(archivos, video_id)
-        titulo = elegido.split(" [" + video_id + "]")[0] or video_id
+        titulo = _titulo_de_info(tmp, video_id, video_id)
         with open(os.path.join(tmp, elegido), encoding="utf-8") as fh:
             contenido = fh.read()
 
-    os.makedirs(CACHE, exist_ok=True)
-    with open(os.path.join(CACHE, video_id + ".vtt"), "w", encoding="utf-8") as fh:
-        fh.write(contenido)
-    with open(os.path.join(CACHE, video_id + ".titulo"), "w", encoding="utf-8") as fh:
-        fh.write(titulo)
+    _guardar_cache(video_id + ".vtt", contenido)
+    _guardar_cache(video_id + ".titulo", titulo)
     return contenido, titulo
 
 
@@ -175,7 +346,7 @@ def _binario_whisperx():
 
 def _leer_cache_whisper(video_id):
     """Devuelve (cues, titulo) si hay una transcripcion guardada y compatible."""
-    ruta = os.path.join(CACHE, video_id + ".whisperx.json")
+    ruta = _ruta_cache(video_id + ".whisperx.json")
     if not os.path.exists(ruta):
         return None
     try:
@@ -183,12 +354,25 @@ def _leer_cache_whisper(video_id):
             datos = json.load(fh)
     except (ValueError, OSError):
         return None
-    # Una transcripcion vieja o hecha con otro modelo no sirve: se rehace.
-    if datos.get("version") != VERSION_CACHE_WHISPER:
-        return None
+    # Una transcripcion hecha con otro modelo o en otro idioma no sirve: se rehace.
     if datos.get("modelo") != MODELO_WHISPER:
         return None
-    cues = [(float(segundos), texto) for segundos, texto in datos.get("palabras", [])]
+    if datos.get("idioma", IDIOMA) != IDIOMA:
+        return None
+    version = datos.get("version")
+    if version == VERSION_CACHE_WHISPER and datos.get("transcripcion"):
+        # Rearmar los cues desde el crudo cuesta milisegundos; transcribir de nuevo,
+        # horas. Por eso el crudo se guarda aunque ocupe mas.
+        cues = _cues_de_transcripcion(datos["transcripcion"])
+    elif version == 2 and datos.get("palabras"):
+        # Formato viejo: solo los cues ya armados. Siguen sirviendo tal cual, asi que
+        # nadie tiene que re-transcribir lo que ya tenia cacheado.
+        try:
+            cues = [(float(segundos), texto) for segundos, texto in datos["palabras"]]
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
     if not cues:
         return None
     return cues, datos.get("titulo") or video_id
@@ -210,9 +394,17 @@ def _cues_de_palabras(transcripcion):
             if inicio is None:
                 # wav2vec2 no alinea numeros ni simbolos: heredan el ultimo tiempo conocido.
                 inicio = cues[-1][0] if cues else segmento.get("start")
-            if inicio is not None:
-                cues.append((float(inicio), texto))
+            if inicio is None:
+                # Descartarla la sacaba del indice, no solo del timing: una frase que
+                # la contuviera dejaba de matchear porque le faltaba una palabra.
+                inicio = 0.0
+            cues.append((float(inicio), texto))
     return cues
+
+
+def _cues_de_transcripcion(transcripcion):
+    """Los cues por palabra, o los del segmento entero si la alineacion fallo."""
+    return _cues_de_palabras(transcripcion) or _cues_de_segmentos(transcripcion)
 
 
 def _cues_de_segmentos(transcripcion):
@@ -238,9 +430,22 @@ def transcribir_whisper(video_id):
     if not binario:
         raise ErrorDeUso(
             "No encontré whisperx. Debería estar en la carpeta .venv del proyecto. "
-            "Abrí la Terminal en esta carpeta y corré:  uv venv && uv pip install whisperx"
+            "Abrí la Terminal en esta carpeta y corré:  "
+            "uv venv --python 3.12 && uv pip install -r requirements.txt"
         )
+    # Se chequean antes de bajar nada: si faltan, subprocess tira FileNotFoundError y
+    # el usuario terminaba viendo un "algo falló" generico en vez del comando a correr.
+    _exigir("yt-dlp", "brew install yt-dlp")
+    _exigir("ffmpeg", "brew install ffmpeg")
 
+    with _candado("whisper:" + video_id):
+        cacheado = _leer_cache_whisper(video_id)
+        if cacheado:
+            return cacheado
+        return _transcribir_whisper(video_id, binario)
+
+
+def _transcribir_whisper(video_id, binario):
     with tempfile.TemporaryDirectory() as tmp:
         audio = os.path.join(tmp, "audio.wav")
         comando_audio = [
@@ -248,79 +453,73 @@ def transcribir_whisper(video_id):
             "-x", "--audio-format", "wav",
             # Whisper trabaja en 16 kHz mono igual: pedirlo asi achica mucho el archivo.
             "--postprocessor-args", "ffmpeg:-ac 1 -ar 16000",
+            # El titulo sale de aca. Antes era una segunda invocacion completa de
+            # yt-dlp: un viaje de red mas y una chance mas de comerse un 429 justo
+            # despues de haber bajado bien el audio.
+            "--write-info-json",
             "--no-playlist",
             "--no-warnings",
-            "-o", audio,
-            "https://www.youtube.com/watch?v=" + video_id,
+            "-o", os.path.join(tmp, "audio.%(ext)s"),
+            URL_VIDEO % video_id,
         ]
-        try:
-            proceso = subprocess.run(
-                comando_audio, capture_output=True, text=True, timeout=600
-            )
-        except subprocess.TimeoutExpired:
-            raise ErrorDeUso("YouTube tardó demasiado en responder. Probá de nuevo.")
+        _codigo, salida, error = _correr(
+            comando_audio, 600, "YouTube tardó demasiado en responder. Probá de nuevo."
+        )
+        # Lo que decide no es el returncode sino que el wav haya quedado: yt-dlp puede
+        # salir con 0 y no haber escrito nada si el postprocesador falló.
         if not os.path.exists(audio):
-            _diagnosticar_fallo(proceso.stderr + proceso.stdout)
+            _diagnosticar_fallo(error + salida, "el audio")
 
-        comando_titulo = [
-            "yt-dlp", "--skip-download", "--print", "%(title)s", "--no-warnings",
-            "https://www.youtube.com/watch?v=" + video_id,
-        ]
-        try:
-            proceso_titulo = subprocess.run(
-                comando_titulo, capture_output=True, text=True, timeout=60
-            )
-            titulo = proceso_titulo.stdout.strip() or video_id
-        except subprocess.TimeoutExpired:
-            titulo = video_id
+        titulo = _titulo_de_info(tmp, "audio", video_id)
 
         comando_whisper = [
             binario, audio,
             "--model", MODELO_WHISPER,
-            "--language", IDIOMA_WHISPER,
+            "--language", IDIOMA,
             # ctranslate2 en CPU no tiene float16; int8 es lo que lo hace usable.
             "--compute_type", "int8",
+            # Explicito para que un cambio de default en whisperx no nos mande a cuda.
+            "--device", "cpu",
             "--threads", str(os.cpu_count() or 4),
             "--output_format", "json",
             "--output_dir", tmp,
             "--verbose", "False",
+            # Imprime "Progress: 12.34%..." por stdout, que _correr deja salir a la
+            # terminal. Sin esto la transcripcion corria a ciegas hasta 90 minutos.
+            "--print_progress", "True",
         ]
         print("Transcribiendo %s con whisperx (%s)…" % (video_id, MODELO_WHISPER))
-        try:
-            proceso = subprocess.run(
-                comando_whisper, capture_output=True, text=True, timeout=5400
-            )
-        except subprocess.TimeoutExpired:
-            raise ErrorDeUso(
-                "La transcripción tardó demasiado. Probá con un video más corto."
-            )
+        codigo, _salida, error = _correr(
+            comando_whisper, 5400,
+            "La transcripción tardó demasiado. Probá con un video más corto.",
+            mostrar_salida=True,
+        )
 
         json_path = os.path.join(tmp, "audio.json")
-        if proceso.returncode != 0 or not os.path.exists(json_path):
-            _avisar_en_consola(proceso.stderr)
+        if codigo != 0 or not os.path.exists(json_path):
+            _avisar_en_consola(error)
             raise ErrorDeUso("No se pudo transcribir el audio de ese video.")
 
         with open(json_path, encoding="utf-8") as fh:
             transcripcion = json.load(fh)
 
-    cues = _cues_de_palabras(transcripcion) or _cues_de_segmentos(transcripcion)
+    cues = _cues_de_transcripcion(transcripcion)
     if not cues:
         raise ErrorDeUso("La transcripción de ese video vino vacía.")
 
-    os.makedirs(CACHE, exist_ok=True)
-    with open(os.path.join(CACHE, video_id + ".whisperx.json"), "w", encoding="utf-8") as fh:
-        json.dump({
-            "version": VERSION_CACHE_WHISPER,
-            "modelo": MODELO_WHISPER,
-            "titulo": titulo,
-            "palabras": [[round(segundos, 2), texto] for segundos, texto in cues],
-        }, fh, ensure_ascii=False)
+    _guardar_cache(video_id + ".whisperx.json", json.dumps({
+        "version": VERSION_CACHE_WHISPER,
+        "modelo": MODELO_WHISPER,
+        "idioma": IDIOMA,
+        "titulo": titulo,
+        "transcripcion": transcripcion,
+    }, ensure_ascii=False))
     return cues, titulo
 
 
 def _avisar_en_consola(salida):
     """El stderr crudo no va al navegador, pero sirve tenerlo en la ventana del servidor."""
-    lineas = [l for l in (salida or "").splitlines() if l.strip()][-20:]
+    lineas = [linea for linea in (salida or "").splitlines() if linea.strip()][-20:]
     if lineas:
         print("whisperx falló:", file=sys.stderr)
         for linea in lineas:
@@ -329,49 +528,116 @@ def _avisar_en_consola(salida):
 
 # --- parseo del vtt --------------------------------------------------------
 
+_TAG_TIEMPO = re.compile(r"<(\d{1,2}:\d{2}:\d{2}[.,]\d{1,3})>")
+_ENCABEZADOS = ("WEBVTT", "Kind:", "Language:", "NOTE", "STYLE", "REGION",
+                "X-TIMESTAMP-MAP")
+
+
 def _a_segundos(marca):
+    """Segundos enteros, o None si la marca no es un timestamp valido.
+
+    Devolver None en vez de reventar importa: una linea de subtitulo que contenga
+    "-->" (un video de programacion, por ejemplo) hacia que el ValueError se llevara
+    puesta la busqueda entera en vez de perder un solo cue.
+    """
     partes = marca.split(":")
     if len(partes) == 2:
         partes = ["0"] + partes
-    horas, minutos, segundos = partes
-    return int(float(horas) * 3600 + float(minutos) * 60 + float(segundos))
+    if len(partes) != 3:
+        return None
+    try:
+        horas, minutos, segundos = (float(p.replace(",", ".")) for p in partes)
+    except ValueError:
+        return None
+    return int(horas * 3600 + minutos * 60 + segundos)
+
+
+def _limpiar(texto):
+    """Saca los tags del cue y desescapa las entidades, en ese orden.
+
+    Al reves, un "&lt;b&gt;" escrito por el autor se volveria un tag de verdad y el
+    regex se comeria el texto que viene despues. Sin el unescape, "AT&amp;T" quedaba
+    tal cual en el indice y buscar "AT&T" no encontraba nada.
+    """
+    texto = re.sub(r"<[^>]+>", "", texto)
+    texto = html.unescape(texto)
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def _piezas_de_linea(linea, inicio):
+    """Parte una linea del vtt en (segundo, texto) usando los tags de tiempo inline.
+
+    Los autosubs traen el timing de cada palabra dentro del propio cue
+    ("hola<00:00:01.359><c> mundo</c>"). Aprovecharlo da precision por palabra sin
+    bajar el audio ni transcribir: es casi lo mismo que consigue el modo IA, gratis.
+    Una linea sin tags devuelve una sola pieza, que es lo que se hacia antes.
+    """
+    piezas, actual = [], inicio
+    for indice, parte in enumerate(_TAG_TIEMPO.split(linea)):
+        if indice % 2:                      # los impares son las marcas capturadas
+            marca = _a_segundos(parte)
+            if marca is not None:
+                actual = marca
+            continue
+        texto = _limpiar(parte)
+        if texto:
+            piezas.append((actual, texto))
+    return piezas
 
 
 def parsear_vtt(contenido):
-    """Devuelve [(segundo_inicio, texto)] sin las repeticiones de los auto-subs."""
+    """Devuelve [(segundo, texto)] por palabra, sin las repeticiones de los autosubs.
+
+    La deduplicacion trabaja a nivel de linea, que es donde los autosubs repiten, y
+    recien despues cada linea que sobrevive se abre en sus palabras con timing propio.
+    """
+    lineas = contenido.splitlines()
     crudos, inicio = [], None
-    for linea in contenido.splitlines():
+    for numero, linea in enumerate(lineas):
         linea = linea.strip()
         if "-->" in linea:
             inicio = _a_segundos(linea.split("-->")[0].strip())
             continue
         if inicio is None or not linea:
             continue
-        if linea.startswith(("WEBVTT", "Kind:", "Language:", "NOTE")):
+        if linea.startswith(_ENCABEZADOS):
             continue
-        texto = re.sub(r"<[^>]+>", "", linea)
-        texto = re.sub(r"\s+", " ", texto).strip()
-        if texto:
-            crudos.append((inicio, texto))
+        # Identificador de cue: una linea suelta justo antes de un timestamp. Los
+        # autosubs de YouTube no los traen, pero un vtt convertido desde srt si, y
+        # sin esto los numeros de cue entraban al indice como texto hablado.
+        if numero + 1 < len(lineas) and "-->" in lineas[numero + 1]:
+            continue
+        piezas = _piezas_de_linea(linea, inicio)
+        if piezas:
+            crudos.append((piezas[0][0], " ".join(t for _, t in piezas), piezas))
 
-    # Los auto-subs muestran la linea anterior como contexto de la siguiente: si una
+    # Los autosubs muestran la linea anterior como contexto de la siguiente: si una
     # es prefijo de la otra, se queda la version larga con el timestamp mas temprano.
     fusionados = []
-    for segundos, texto in crudos:
-        if fusionados and texto.startswith(fusionados[-1][1]):
-            fusionados[-1] = (fusionados[-1][0], texto)
-        elif not fusionados or texto != fusionados[-1][1]:
-            fusionados.append((segundos, texto))
+    for segundos, texto, piezas in crudos:
+        if fusionados and texto == fusionados[-1][1]:
+            # Repeticion exacta: se queda la primera, que trae el timestamp real y,
+            # cuando la repeticion viene sin tags, tambien el timing por palabra.
+            continue
+        if (fusionados and texto.startswith(fusionados[-1][1])
+                and segundos - fusionados[-1][0] <= VENTANA_FUSION):
+            # La ventana es lo que evita que un "sí" del minuto 0 se coma un
+            # "sí, claro que sí" del minuto 5 y borre la mencion tardia del indice.
+            arranque = fusionados[-1][0]
+            fusionados[-1] = (arranque, texto,
+                              [(arranque, piezas[0][1])] + piezas[1:])
+            continue
+        fusionados.append((segundos, texto, piezas))
 
     limpios = []
-    for segundos, texto in fusionados:
+    for segundos, texto, piezas in fusionados:
         repetido = any(
             texto == prev_texto and segundos - prev_segundos <= VENTANA_DUPLICADOS
-            for prev_segundos, prev_texto in limpios[-8:]
+            for prev_segundos, prev_texto, _ in limpios[-8:]
         )
         if not repetido:
-            limpios.append((segundos, texto))
-    return limpios
+            limpios.append((segundos, texto, piezas))
+    return [pieza for _, _, piezas in limpios for pieza in piezas]
 
 
 # --- busqueda --------------------------------------------------------------
@@ -385,6 +651,75 @@ def construir_indice(cues):
         offsets.extend([segundos] * len(fragmento))
     completo = "".join(partes)
     return completo, normalizar(completo), offsets
+
+
+# El indice de un video de 3 h son unos 2 MB, asi que guardamos unos pocos.
+MAX_INDICES = 6
+_INDICES = {}
+_LOCK_INDICES = threading.Lock()
+
+
+def indice_de(video_id, forzar_whisper):
+    """(indice, titulo, fuente), armando el indice una sola vez por video.
+
+    Sin esto, cada consulta volvia a leer el cache del disco, a re-parsear el vtt
+    entero y a re-normalizarlo caracter por caracter: decenas de milisegundos por
+    tecla, para un resultado que no cambia mientras no cambie el video.
+    """
+    fuente = "whisperx" if forzar_whisper else "subtitulos"
+    clave = (video_id, fuente)
+    with _LOCK_INDICES:
+        if clave in _INDICES:
+            _INDICES[clave] = _INDICES.pop(clave)   # al final: se descarta el mas viejo
+            indice, titulo = _INDICES[clave]
+            return indice, titulo, fuente
+
+    if forzar_whisper:
+        cues, titulo = transcribir_whisper(video_id)
+    else:
+        contenido, titulo = bajar_subs(video_id)
+        cues = parsear_vtt(contenido)
+        if not cues:
+            raise ErrorDeUso("Los subtítulos de este video vinieron vacíos.")
+
+    indice = construir_indice(cues)
+    with _LOCK_INDICES:
+        _INDICES[clave] = (indice, titulo)
+        while len(_INDICES) > MAX_INDICES:
+            _INDICES.pop(next(iter(_INDICES)))
+    return indice, titulo, fuente
+
+
+def agrupar(completo, offsets):
+    """Corta el texto corrido en bloques legibles, cada uno con el segundo en que arranca.
+
+    Corta por largo o por salto de tiempo, lo que llegue primero: un bloque que abarca
+    medio minuto de video ya es demasiado grande para que su timestamp signifique algo,
+    y en un video con silencios largos pasa aunque el bloque sea corto.
+    """
+    bloques, inicio, total = [], 0, len(completo)
+    while inicio < total:
+        while inicio < total and completo[inicio].isspace():
+            inicio += 1
+        if inicio >= total:
+            break
+        tope = min(total, inicio + LARGO_BLOQUE)
+        fin = tope
+        arranque = offsets[inicio]
+        for posicion in range(inicio, tope):
+            if offsets[posicion] - arranque > SEGUNDOS_BLOQUE:
+                fin = posicion
+                break
+        # Cortar en el espacio anterior para no partir una palabra al medio.
+        if fin < total:
+            corte = completo.rfind(" ", inicio, fin)
+            if corte > inicio:
+                fin = corte
+        texto = completo[inicio:fin].strip()
+        if texto:
+            bloques.append((arranque, texto))
+        inicio = fin
+    return bloques
 
 
 def formatear(segundos):
@@ -410,9 +745,19 @@ def _comprimir(texto_norm):
     return "".join(chars), mapa
 
 
-def _barrer(aguja, pajar, mapa, completo, offsets, video_id, ventana_dup, aproximado):
-    """Todas las apariciones de `aguja` en `pajar`, ubicadas en el texto original."""
-    resultados, vistos, desde = [], [], 0
+def _barrer(aguja, pajar, mapa, completo, offsets, video_id, aproximado):
+    """Todas las apariciones de `aguja` en `pajar`, ubicadas en el texto original.
+
+    No deduplica: de las repeticiones de los autosubs se encarga parsear_vtt, que
+    trabaja a nivel de linea y sabe cuales son la misma frase rotando en pantalla.
+    Aca habia un segundo filtro por tiempo que descartaba cualquier match a menos de
+    diez segundos del anterior, y se llevaba puestas menciones reales: medido sobre
+    un video de una hora, "que" pasaba de 200 menciones a 63.
+
+    Devuelve (resultados, total): se arman como mucho MAX_RESULTADOS, pero el total
+    se sigue contando para poder avisar que la lista quedo cortada.
+    """
+    resultados, desde, total = [], 0, 0
     while True:
         idx = pajar.find(aguja, desde)
         if idx == -1:
@@ -420,10 +765,9 @@ def _barrer(aguja, pajar, mapa, completo, offsets, video_id, ventana_dup, aproxi
         desde = idx + 1
         real = mapa[idx] if mapa else idx
         segundos = offsets[real]
-        # Un mismo dicho puede matchear dos veces si el texto quedo repetido.
-        if ventana_dup and any(segundos - previo <= ventana_dup for previo in vistos[-4:]):
+        total += 1
+        if len(resultados) >= MAX_RESULTADOS:
             continue
-        vistos.append(segundos)
 
         arranque = max(0, real - CONTEXTO)
         fin = min(len(completo), real + len(aguja) + CONTEXTO)
@@ -433,42 +777,53 @@ def _barrer(aguja, pajar, mapa, completo, offsets, video_id, ventana_dup, aproxi
         if fin < len(completo):
             fragmento = fragmento + "…"
 
-        resultados.append({
-            "segundos": int(segundos),
-            "timestamp": formatear(segundos),
-            "texto": fragmento,
-            "link": "https://youtu.be/%s?t=%d" % (video_id, int(segundos)),
-            "aproximado": aproximado,
-        })
-    return resultados
+        resultados.append(_resultado(segundos, fragmento, video_id, aproximado))
+    return resultados, total
 
 
-def buscar(cues, consulta, video_id, ventana_dup=VENTANA_DUPLICADOS):
-    """ventana_dup=0 muestra todas las menciones, incluso dos seguidas.
+def _resultado(segundos, texto, video_id, aproximado=False):
+    return {
+        "segundos": int(segundos),
+        "timestamp": formatear(segundos),
+        "texto": texto,
+        "link": "https://youtu.be/%s?t=%d" % (video_id, int(segundos)),
+        "aproximado": aproximado,
+    }
 
-    Solo hace falta filtrar con los subtitulos automaticos de YouTube, que repiten
-    cada linea en pantalla; whisperx no repite nada.
+
+def transcripcion(indice, video_id):
+    """La transcripcion entera, con la misma forma que los resultados de una busqueda.
+
+    Asi el navegador la pinta con el mismo codigo: cada bloque es un link al video en
+    el momento en que arranca.
     """
+    completo, _norm, offsets = indice
+    return [_resultado(segundos, texto, video_id)
+            for segundos, texto in agrupar(completo, offsets)]
+
+
+def buscar(indice, consulta, video_id):
+    """Devuelve (resultados, total) para la consulta sobre un indice ya armado."""
     consulta = re.sub(r"\s+", " ", (consulta or "").strip())
     if not consulta:
         raise ErrorDeUso("Escribí una palabra o frase para buscar.")
 
-    completo, completo_norm, offsets = construir_indice(cues)
+    completo, completo_norm, offsets = indice
     objetivo = normalizar(consulta)
 
-    exactos = _barrer(objetivo, completo_norm, None, completo, offsets,
-                      video_id, ventana_dup, False)
+    exactos, total = _barrer(objetivo, completo_norm, None, completo, offsets,
+                             video_id, False)
     if exactos:
-        return exactos
+        return exactos, total
 
     # Sin espacios: "popstars" encuentra "Pop stars". Se pide un largo minimo porque
     # pegar las palabras hace que una consulta corta matchee dentro de otra frase.
     if len(objetivo.replace(" ", "")) >= LARGO_MINIMO_APROXIMADO:
         comprimido, mapa = _comprimir(completo_norm)
-        sueltos = _barrer(objetivo.replace(" ", ""), comprimido, mapa, completo,
-                          offsets, video_id, ventana_dup, True)
+        sueltos, total = _barrer(objetivo.replace(" ", ""), comprimido, mapa, completo,
+                                 offsets, video_id, True)
         if sueltos:
-            return sueltos
+            return sueltos, total
 
     # Ultimo intento: recortar el final para que "popstars" alcance a "popstar".
     if " " not in objetivo and len(objetivo) >= LARGO_MINIMO_APROXIMADO + 1:
@@ -476,11 +831,11 @@ def buscar(cues, consulta, video_id, ventana_dup=VENTANA_DUPLICADOS):
             raiz = objetivo[:-recorte]
             if len(raiz) < LARGO_MINIMO_APROXIMADO:
                 break
-            parciales = _barrer(raiz, completo_norm, None, completo, offsets,
-                                video_id, ventana_dup, True)
+            parciales, total = _barrer(raiz, completo_norm, None, completo, offsets,
+                                       video_id, True)
             if parciales:
-                return parciales
-    return []
+                return parciales, total
+    return [], 0
 
 
 # --- servidor --------------------------------------------------------------
@@ -497,12 +852,40 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(cuerpo)
 
+    def _responder_seguro(self, codigo, payload):
+        """Si el usuario cerro la pestaña, el write falla y no vale un traceback."""
+        try:
+            self._responder(codigo, payload)
+        except OSError:
+            pass
+
+    def _mismo_origen(self):
+        """Escuchar solo en 127.0.0.1 no alcanza: el navegador del usuario sigue llegando.
+
+        Un fetch cross-origin con Content-Type JSON queda frenado por el preflight,
+        pero un <form enctype="text/plain"> no lo dispara y su cuerpo se puede armar
+        como JSON valido. Sin este chequeo, cualquier pagina que el usuario visitara
+        podia lanzarle una transcripcion de 90 minutos al 100% de CPU. El Host ademas
+        cierra el rebinding de DNS, que es lo unico que permitiria leer la respuesta.
+        """
+        anfitrion = (self.headers.get("Host") or "").split(":")[0]
+        if anfitrion not in ("127.0.0.1", "localhost"):
+            return False
+        sitio = self.headers.get("Sec-Fetch-Site")
+        if sitio and sitio not in ("same-origin", "none"):
+            return False
+        origen = self.headers.get("Origin")
+        return not origen or origen in ORIGENES
+
     def do_GET(self):
         if self.path.startswith("/api/salud"):
             return self._responder(200, {"ok": True})
         if self.path in ("/", "/index.html"):
-            with open(os.path.join(RAIZ, "index.html"), "rb") as fh:
-                cuerpo = fh.read()
+            try:
+                with open(os.path.join(RAIZ, "index.html"), "rb") as fh:
+                    cuerpo = fh.read()
+            except OSError:
+                return self.send_error(500, "No encuentro index.html")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(cuerpo)))
@@ -511,49 +894,78 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
-        if not self.path.startswith("/api/buscar"):
-            return self.send_error(404)
+        if self.path.startswith("/api/buscar"):
+            return self._api(self._buscar)
+        if self.path.startswith("/api/transcripcion"):
+            return self._api(self._transcripcion)
+        self.send_error(404)
+
+    def _api(self, accion):
+        """Lo comun a las dos rutas: chequeo de origen, cuerpo, video y errores.
+
+        Las dos devuelven `resultados` con la misma forma, asi que el navegador las
+        pinta con el mismo codigo.
+        """
+        if not self._mismo_origen():
+            return self.send_error(403, "Pedido de otro origen")
         try:
-            largo = int(self.headers.get("Content-Length") or 0)
-            if largo > 10000:
-                raise ErrorDeUso("El pedido es demasiado grande.")
-            datos = json.loads(self.rfile.read(largo) or b"{}")
-
+            datos = self._leer_json()
             video_id = extraer_id(datos.get("url"))
-            forzar_whisper = bool(datos.get("forzar_whisper"))
-
-            if forzar_whisper:
-                cues, titulo = transcribir_whisper(video_id)
-                fuente, ventana = "whisperx", 0
-            else:
-                contenido, titulo = bajar_subs(video_id)
-                cues = parsear_vtt(contenido)
-                if not cues:
-                    raise ErrorDeUso("Los subtítulos de este video vinieron vacíos.")
-                fuente, ventana = "subtitulos", VENTANA_DUPLICADOS
-
-            resultados = buscar(cues, datos.get("consulta"), video_id, ventana)
-            self._responder(200, {
-                "titulo": titulo,
-                "video_id": video_id,
-                "fuente": fuente,
-                "resultados": resultados,
-            })
+            indice, titulo, fuente = indice_de(
+                video_id, bool(datos.get("forzar_whisper"))
+            )
+            payload = accion(datos, indice, video_id)
+            payload.update({"titulo": titulo, "video_id": video_id, "fuente": fuente})
+            self._responder(200, payload)
         except ErrorDeUso as err:
-            self._responder(400, {"error": str(err)})
+            self._responder_seguro(400, {"error": str(err)})
         except Exception:
             # Nunca filtramos el stack ni el stderr crudo de yt-dlp a la UI.
-            self._responder(500, {"error": "Algo falló al procesar el video."})
+            self._responder_seguro(500, {"error": "Algo falló al procesar el video."})
+
+    def _leer_json(self):
+        try:
+            largo = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ErrorDeUso("El pedido vino mal armado.") from None
+        if largo > 10000:
+            raise ErrorDeUso("El pedido es demasiado grande.")
+        datos = json.loads(self.rfile.read(largo) or b"{}")
+        if not isinstance(datos, dict):
+            raise ErrorDeUso("El pedido vino mal armado.")
+        return datos
+
+    def _buscar(self, datos, indice, video_id):
+        resultados, total = buscar(indice, datos.get("consulta"), video_id)
+        return {"resultados": resultados, "total": total}
+
+    def _transcripcion(self, _datos, indice, video_id):
+        bloques = transcripcion(indice, video_id)
+        return {"resultados": bloques, "total": len(bloques)}
 
 
 def main():
-    servidor = ThreadingHTTPServer(("127.0.0.1", PUERTO), Handler)
+    # start.command manda SIGTERM al cerrar la ventana y cuenta con que esto se lleve
+    # puestos a yt-dlp y whisperx: si no, siguen vivos comiendose todos los cores.
+    # SIGHUP tambien, porque al cerrar la ventana la Terminal se lo manda directo a
+    # este proceso y el default de Python es morirse sin correr ningun handler.
+    for senal in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if senal is not None:
+            signal.signal(senal, _matar_hijos)
+    try:
+        servidor = ThreadingHTTPServer(("127.0.0.1", PUERTO), Handler)
+    except OSError as err:
+        print("No pude abrir el puerto %d (%s)." % (PUERTO, err), file=sys.stderr)
+        print("¿Ya tenés otra ventana del buscador abierta?", file=sys.stderr)
+        return 1
     print("Buscador andando en http://127.0.0.1:%d" % PUERTO)
     print("Para cerrarlo: Ctrl+C")
     try:
         servidor.serve_forever()
     except KeyboardInterrupt:
         print("\nChau.")
+    finally:
+        _terminar_hijos()
         servidor.server_close()
 
 

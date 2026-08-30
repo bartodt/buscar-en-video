@@ -1,0 +1,11 @@
+# Dependencias del modo "Transcribir con IA". Van en el .venv del proyecto, no en el
+# Python del sistema: el servidor (app.py) corre con la stdlib y nada más, y llama a
+# whisperx como un proceso externo.
+#
+#   uv venv --python 3.12
+#   uv pip install -r requirements.txt
+#
+# Python 3.12: whisperx todavía no soporta 3.13 y la instalación falla.
+# El pin importa porque la CLI de whisperx cambia entre versiones: app.py le pasa
+# --compute_type, --threads, --device y --print_progress, y no son estables.
+whisperx==3.8.6

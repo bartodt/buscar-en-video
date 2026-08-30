@@ -63,7 +63,7 @@ Desde **esta carpeta** (la que contiene `app.py`):
 
 ```bash
 uv venv --python 3.12
-uv pip install "whisperx==3.8.6"
+uv pip install -r requirements.txt
 ```
 
 Notas que importan:
@@ -110,6 +110,12 @@ curl -fs http://127.0.0.1:8765/api/salud
 ```
 
 Tiene que devolver `{"ok": true}`.
+
+Los tests del parseo y la búsqueda no necesitan red ni nada instalado:
+
+```bash
+python3 -m unittest test_app
+```
 
 Prueba real del modo subtítulos (rápida, ~10 segundos) — usá un video de YouTube
 cualquiera que tenga subtítulos:
