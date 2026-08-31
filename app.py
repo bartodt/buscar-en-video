@@ -19,13 +19,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 RAIZ = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.expanduser("~/.cache/buscar-en-video")
-PUERTO = int(os.environ.get("BUSCAR_PUERTO") or 8765)
+PUERTO = 8765
 ORIGENES = ("http://127.0.0.1:%d" % PUERTO, "http://localhost:%d" % PUERTO)
 
 # El idioma sale de aca y de ningun otro lado: antes estaba escrito por separado en
 # el --sub-langs de yt-dlp, en la preferencia de pistas y en el --language de
 # whisperx, y los tres se podian desincronizar.
-IDIOMA = os.environ.get("BUSCAR_IDIOMA") or "es"
+IDIOMA = "es"
 
 # Los subtitulos automaticos repiten cada linea mientras rota en pantalla; dos cues
 # identicos dentro de esta ventana son la misma frase dicha una sola vez.
@@ -69,12 +69,7 @@ _LOCK_HIJOS = threading.Lock()
 
 @contextlib.contextmanager
 def _carpeta_temporal():
-    """tempfile.TemporaryDirectory, pero anotada para poder borrarla al salir.
-
-    Los threads del servidor son daemon: al cerrar la ventana mueren sin correr sus
-    finally, y el wav de una transcripcion a medias (~170 MB en un video de 90 min)
-    quedaba tirado en /var/folders.
-    """
+    """tempfile.TemporaryDirectory, pero anotada para que _terminar_hijos la borre."""
     tmp = tempfile.mkdtemp(prefix="buscar-en-video-")
     with _LOCK_HIJOS:
         _TEMPORALES.add(tmp)
@@ -86,11 +81,27 @@ def _carpeta_temporal():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _matar(proceso):
+    """SIGKILL a todo el grupo, no solo al hijo.
+
+    yt-dlp lanza ffmpeg y le pasa sus pipes. Matando solo al padre, ffmpeg seguia
+    vivo comiendose los cores y, peor, manteniendo abierto el stderr heredado: el
+    communicate() de abajo esperaba un EOF que no llegaba nunca y colgaba el thread
+    del pedido para siempre. Por eso los hijos arrancan en su propia sesion.
+    """
+    try:
+        os.killpg(os.getpgid(proceso.pid), signal.SIGKILL)
+    except OSError:
+        proceso.kill()
+
+
 def _correr(comando, timeout, mensaje_timeout, mostrar_salida=False):
     """subprocess.run, pero con el hijo anotado para poder matarlo al salir.
 
-    Sin el registro, cerrar la ventana mata al servidor y deja a whisperx
-    transcribiendo al 100% de CPU hasta una hora, sin ventana que lo delate.
+    Los threads del servidor son daemon: al cerrar la ventana mueren sin correr sus
+    finally. Sin este registro, cerrar la ventana dejaba a whisperx transcribiendo al
+    100% de CPU hasta una hora y el wav a medias (~170 MB en un video de 90 min)
+    tirado en /var/folders, sin ninguna ventana que lo delatara.
     Con mostrar_salida el stdout del hijo va a la terminal en vez de juntarse en
     memoria: es como se ve el progreso de una transcripcion larga.
     """
@@ -99,13 +110,14 @@ def _correr(comando, timeout, mensaje_timeout, mostrar_salida=False):
         stdout=None if mostrar_salida else subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        start_new_session=True,
     )
     with _LOCK_HIJOS:
         _HIJOS.add(proceso)
     try:
         salida, error = proceso.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proceso.kill()
+        _matar(proceso)
         proceso.communicate()
         raise ErrorDeUso(mensaje_timeout) from None
     finally:
@@ -114,19 +126,20 @@ def _correr(comando, timeout, mensaje_timeout, mostrar_salida=False):
     return proceso.returncode, salida or "", error or ""
 
 
-def _terminar_hijos():
+def _terminar_hijos(*senal):
+    """Mata a los hijos y borra los temporales; ver _correr.
+
+    Con argumentos es el handler de SIGTERM/SIGHUP y ademas termina el proceso:
+    start.command cuenta con eso para no dejar huerfanos al cerrar la ventana.
+    """
     with _LOCK_HIJOS:
         hijos, temporales = list(_HIJOS), list(_TEMPORALES)
     for proceso in hijos:
-        proceso.kill()
+        _matar(proceso)
     for tmp in temporales:
         shutil.rmtree(tmp, ignore_errors=True)
-
-
-def _matar_hijos(*_args):
-    """Handler de SIGTERM/SIGHUP. start.command cuenta con esto para no dejar huerfanos."""
-    _terminar_hijos()
-    sys.exit(0)
+    if senal:
+        sys.exit(0)
 
 
 def _exigir(binario, arreglo):
@@ -212,6 +225,11 @@ def extraer_id(url):
 
 
 def _leer_cache(video_id, ignorar_ttl=False):
+    """Devuelve (contenido_vtt, titulo, idioma) si hay algo guardado y vigente.
+
+    Sin el .meta.json no sabemos de que pista salio el vtt, y esa es justamente la
+    diferencia entre la transcripcion real y una traduccion automatica: se rebaja.
+    """
     vtt = _ruta_cache(video_id + ".vtt")
     if not os.path.exists(vtt):
         return None
@@ -220,17 +238,13 @@ def _leer_cache(video_id, ignorar_ttl=False):
     try:
         with open(vtt, encoding="utf-8") as fh:
             contenido = fh.read()
-    except (OSError, UnicodeDecodeError):
+        with open(_ruta_cache(video_id + ".meta.json"), encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (ValueError, OSError):
         return None
     if not contenido.strip():
         return None
-    titulo = video_id
-    try:
-        with open(_ruta_cache(video_id + ".titulo"), encoding="utf-8") as fh:
-            titulo = fh.read().strip() or video_id
-    except (OSError, UnicodeDecodeError):
-        pass
-    return contenido, titulo
+    return contenido, meta.get("titulo") or video_id, meta.get("idioma") or ""
 
 
 def _diagnosticar_fallo(salida, que="los subtítulos"):
@@ -261,7 +275,6 @@ def _diagnosticar_fallo(salida, que="los subtítulos"):
 # real del audio: "es" a secas puede ser una traduccion de la traduccion al ingles,
 # con palabras cambiadas respecto de lo que se dice de verdad.
 PREFERENCIA_SUBS = (IDIOMA + "-orig", IDIOMA)
-NOMBRE_IDIOMA = {"es": "español", "en": "inglés", "pt": "portugués"}.get(IDIOMA, IDIOMA)
 URL_VIDEO = "https://www.youtube.com/watch?v=%s"
 
 
@@ -284,18 +297,37 @@ def _titulo_de_info(tmp, base, respaldo):
 
 
 def _elegir_sub(archivos, video_id):
+    """(archivo, idioma) de la mejor pista que haya bajado."""
     por_idioma = {_idioma_de(f, video_id): f for f in archivos}
     for idioma in PREFERENCIA_SUBS:
         if idioma in por_idioma:
-            return por_idioma[idioma]
-    return archivos[0]
+            return por_idioma[idioma], idioma
+    # Ultimo recurso: alguna variante suelta ("es-419", "es-US"). En un video hablado
+    # en otro idioma eso es una traduccion automatica, asi que se avisa.
+    return archivos[0], _idioma_de(archivos[0], video_id)
+
+
+def _aviso_de(idioma, vencido=False):
+    """El texto que la interfaz muestra al lado del titulo, o None si no hay nada raro."""
+    if vencido:
+        return "subtítulos guardados, no pude refrescarlos"
+    if idioma and idioma not in PREFERENCIA_SUBS:
+        return ("subtítulos traducidos automáticamente, las palabras pueden no ser "
+                "las que se dijeron")
+    return None
+
+
+def _con_aviso(cacheado, vencido=False):
+    """(contenido, titulo, aviso) a partir de lo que devolvio _leer_cache."""
+    contenido, titulo, idioma = cacheado
+    return contenido, titulo, _aviso_de(idioma, vencido)
 
 
 def bajar_subs(video_id):
-    """Devuelve (contenido_vtt, titulo). Usa el cache si ya se bajó antes."""
+    """Devuelve (contenido_vtt, titulo, aviso). Usa el cache si ya se bajó antes."""
     cacheado = _leer_cache(video_id)
     if cacheado:
-        return cacheado
+        return _con_aviso(cacheado)
 
     _exigir("yt-dlp", "brew install yt-dlp")
 
@@ -303,17 +335,16 @@ def bajar_subs(video_id):
         # Otro pedido del mismo video pudo haberlo bajado mientras esperabamos.
         cacheado = _leer_cache(video_id)
         if cacheado:
-            return cacheado
+            return _con_aviso(cacheado)
         try:
             return _bajar_subs(video_id)
         except ErrorDeUso:
             # Un cache vencido sigue siendo mejor que nada: si YouTube no responde o
             # no hay red, se busca sobre lo viejo antes que dejar al usuario a pie.
+            # El aviso viaja hasta la interfaz: un print a stderr no lo ve nadie.
             vencido = _leer_cache(video_id, ignorar_ttl=True)
             if vencido:
-                print("Aviso: no pude refrescar %s, uso los subtítulos guardados."
-                      % video_id, file=sys.stderr)
-                return vencido
+                return _con_aviso(vencido, vencido=True)
             raise
 
 
@@ -341,21 +372,36 @@ def _bajar_subs(video_id):
             if codigo != 0:
                 _diagnosticar_fallo(error + salida)
             raise ErrorDeUso(
-                "Ese video no tiene subtítulos en %s, ni siquiera automáticos, "
-                "así que no hay texto donde buscar." % NOMBRE_IDIOMA
+                "Ese video no tiene subtítulos en español, ni siquiera "
+                "automáticos, así que no hay texto donde buscar."
             )
 
-        elegido = _elegir_sub(archivos, video_id)
+        elegido, idioma = _elegir_sub(archivos, video_id)
         titulo = _titulo_de_info(tmp, video_id, video_id)
         with open(os.path.join(tmp, elegido), encoding="utf-8") as fh:
             contenido = fh.read()
 
     _guardar_cache(video_id + ".vtt", contenido)
-    _guardar_cache(video_id + ".titulo", titulo)
-    return contenido, titulo
+    _guardar_cache(video_id + ".meta.json",
+                   json.dumps({"titulo": titulo, "idioma": idioma}, ensure_ascii=False))
+    return contenido, titulo, _aviso_de(idioma)
 
 
 # --- whisperx (transcripcion con IA) ---------------------------------------
+
+def _hilos():
+    """Solo los cores de rendimiento.
+
+    os.cpu_count() en Apple Silicon cuenta tambien los de eficiencia, y ctranslate2
+    reparte el trabajo parejo entre todos: los lentos terminan marcando el ritmo.
+    Sin medir todavia sobre este equipo; si no mejora, volver a os.cpu_count().
+    """
+    try:
+        return max(1, int(subprocess.check_output(
+            ["sysctl", "-n", "hw.perflevel0.logicalcpu"], text=True)))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return os.cpu_count() or 4
+
 
 def _binario_whisperx():
     """whisperx vive en el .venv del proyecto; el servidor corre con el python del sistema."""
@@ -492,7 +538,7 @@ def _transcribir_whisper(video_id, binario):
             "--compute_type", "int8",
             # Explicito para que un cambio de default en whisperx no nos mande a cuda.
             "--device", "cpu",
-            "--threads", str(os.cpu_count() or 4),
+            "--threads", str(_hilos()),
             "--output_format", "json",
             "--output_dir", tmp,
             "--verbose", "False",
@@ -604,9 +650,14 @@ def parsear_vtt(contenido):
     recien despues cada linea que sobrevive se abre en sus palabras con timing propio.
     """
     lineas = contenido.splitlines()
-    crudos, inicio, fin_cue = [], None, None
+    crudos, inicio, fin_cue, en_cue = [], None, None, False
     for numero, linea in enumerate(lineas):
         linea = linea.strip()
+        # La linea en blanco cierra el cue: es lo unico que distingue una linea
+        # estructural de una hablada, porque las dos pueden decir "NOTE ...".
+        if not linea:
+            en_cue = False
+            continue
         if "-->" in linea:
             izquierda, _, derecha = linea.partition("-->")
             inicio = _a_segundos(izquierda.strip())
@@ -614,15 +665,19 @@ def parsear_vtt(contenido):
             # posicion pegados atras ("align:start position:0%").
             marcas = derecha.split()
             fin_cue = _a_segundos(marcas[0]) if marcas else None
+            en_cue = True
             continue
-        if inicio is None or not linea:
+        if inicio is None:
             continue
-        if linea.startswith(_ENCABEZADOS):
+        # Fuera de un cue, NOTE/STYLE/REGION abren un bloque estructural. Adentro,
+        # "NOTE que esto importa" es lo que alguien dijo y va al indice.
+        if not en_cue and linea.startswith(_ENCABEZADOS):
             continue
-        # Identificador de cue: una linea suelta justo antes de un timestamp. Los
+        # Identificador de cue: una linea suelta entre un blanco y un timestamp. Los
         # autosubs de YouTube no los traen, pero un vtt convertido desde srt si, y
-        # sin esto los numeros de cue entraban al indice como texto hablado.
-        if numero + 1 < len(lineas) and "-->" in lineas[numero + 1]:
+        # sin esto los numeros de cue entraban al indice como texto hablado. El
+        # not en_cue evita comerse la ultima linea de un cue sin blanco que lo cierre.
+        if not en_cue and numero + 1 < len(lineas) and "-->" in lineas[numero + 1]:
             continue
         piezas = _piezas_de_linea(linea, inicio)
         if piezas:
@@ -646,9 +701,13 @@ def parsear_vtt(contenido):
         anterior_termina = fusionados[-1][3] if fusionados else None
         if (fusionados and texto.startswith(fusionados[-1][1])
                 and anterior_termina is not None and segundos <= anterior_termina + 1):
-            arranque = fusionados[-1][0]
-            fusionados[-1] = (arranque, texto,
-                              [(arranque, piezas[0][1])] + piezas[1:], fin)
+            arranque, previo, piezas_previas = fusionados[-1][:3]
+            # Cuando el cue nuevo reescribe el texto viejo sin tags, su primera pieza
+            # trae todo junto en un solo tiempo y las de antes traian una marca por
+            # palabra: nos quedamos con las viejas, que es donde esta la precision.
+            nuevas = (piezas_previas if piezas[0][1] == previo
+                      else [(arranque, piezas[0][1])])
+            fusionados[-1] = (arranque, texto, nuevas + piezas[1:], fin)
             continue
         fusionados.append((segundos, texto, piezas, fin))
 
@@ -676,14 +735,15 @@ def construir_indice(cues):
     return completo, normalizar(completo), offsets
 
 
-# El indice de un video de 3 h son unos 2 MB, asi que guardamos unos pocos.
-MAX_INDICES = 6
+# El indice de un video de 3 h son unos 2,5 MB y se mira un video a la vez: con los
+# dos ultimos alcanza para ir y venir entre subtitulos e IA sin rearmar nada.
+MAX_INDICES = 2
 _INDICES = {}
 _LOCK_INDICES = threading.Lock()
 
 
 def indice_de(video_id, forzar_whisper):
-    """(indice, titulo, fuente), armando el indice una sola vez por video.
+    """(indice, titulo, fuente, aviso), armando el indice una sola vez por video.
 
     Sin esto, cada consulta volvia a leer el cache del disco, a re-parsear el vtt
     entero y a re-normalizarlo caracter por caracter: decenas de milisegundos por
@@ -693,24 +753,24 @@ def indice_de(video_id, forzar_whisper):
     clave = (video_id, fuente)
     with _LOCK_INDICES:
         if clave in _INDICES:
-            _INDICES[clave] = _INDICES.pop(clave)   # al final: se descarta el mas viejo
-            indice, titulo = _INDICES[clave]
-            return indice, titulo, fuente
+            indice, titulo, aviso = _INDICES[clave]
+            return indice, titulo, fuente, aviso
 
+    aviso = None
     if forzar_whisper:
         cues, titulo = transcribir_whisper(video_id)
     else:
-        contenido, titulo = bajar_subs(video_id)
+        contenido, titulo, aviso = bajar_subs(video_id)
         cues = parsear_vtt(contenido)
         if not cues:
             raise ErrorDeUso("Los subtítulos de este video vinieron vacíos.")
 
     indice = construir_indice(cues)
     with _LOCK_INDICES:
-        _INDICES[clave] = (indice, titulo)
-        while len(_INDICES) > MAX_INDICES:
-            _INDICES.pop(next(iter(_INDICES)))
-    return indice, titulo, fuente
+        if len(_INDICES) >= MAX_INDICES:
+            _INDICES.clear()
+        _INDICES[clave] = (indice, titulo, aviso)
+    return indice, titulo, fuente, aviso
 
 
 def agrupar(completo, offsets):
@@ -944,15 +1004,16 @@ class Handler(BaseHTTPRequestHandler):
         pinta con el mismo codigo.
         """
         if not self._mismo_origen():
-            return self.send_error(403, "Pedido de otro origen")
+            return self._responder(403, {"error": "Pedido de otro origen."})
         try:
             datos = self._leer_json()
             video_id = extraer_id(datos.get("url"))
-            indice, titulo, fuente = indice_de(
+            indice, titulo, fuente, aviso = indice_de(
                 video_id, bool(datos.get("forzar_whisper"))
             )
             payload = accion(datos, indice, video_id)
-            payload.update({"titulo": titulo, "video_id": video_id, "fuente": fuente})
+            payload.update({"titulo": titulo, "video_id": video_id,
+                            "fuente": fuente, "aviso": aviso})
         except ErrorDeUso as err:
             return self._responder(400, {"error": str(err)})
         except Exception:
@@ -992,13 +1053,11 @@ def main():
     # Sin esto, Python bufferea por bloques cuando la salida no es una terminal y los
     # avisos aparecen despues del progreso de whisperx, o directamente al final.
     sys.stdout.reconfigure(line_buffering=True)
-    # start.command manda SIGTERM al cerrar la ventana y cuenta con que esto se lleve
-    # puestos a yt-dlp y whisperx: si no, siguen vivos comiendose todos los cores.
-    # SIGHUP tambien, porque al cerrar la ventana la Terminal se lo manda directo a
+    # SIGHUP ademas de SIGTERM: al cerrar la ventana la Terminal se lo manda directo a
     # este proceso y el default de Python es morirse sin correr ningun handler.
     for senal in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
         if senal is not None:
-            signal.signal(senal, _matar_hijos)
+            signal.signal(senal, _terminar_hijos)
     try:
         servidor = ThreadingHTTPServer(("127.0.0.1", PUERTO), Handler)
     except OSError as err:

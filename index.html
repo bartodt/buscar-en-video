@@ -255,9 +255,13 @@
       tic = null;
       idsPorUrl.set(url, datos.video_id);
       vistos.add(datos.video_id + "|" + modo);
-      titulo.textContent = datos.fuente === "whisperx"
-        ? `${datos.titulo} — transcripción con IA`
-        : datos.titulo;
+      // El aviso es lo que el servidor no puede decir con los resultados: que los
+      // subtítulos salieron del caché viejo, o que son una traducción automática y
+      // las palabras pueden no ser las que se dijeron.
+      const notas = [];
+      if (datos.fuente === "whisperx") notas.push("transcripción con IA");
+      if (datos.aviso) notas.push(datos.aviso);
+      titulo.textContent = [datos.titulo, ...notas].join(" — ");
       titulo.hidden = false;
 
       if (!datos.resultados.length) {

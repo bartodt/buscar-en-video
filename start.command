@@ -2,8 +2,8 @@
 # Doble clic en Finder para arrancar el buscador.
 cd "$(dirname "$0")" || exit 1
 
-# Misma variable que lee app.py, asi los dos no se pueden desincronizar.
-PUERTO=${BUSCAR_PUERTO:-8765}
+# El mismo que abre app.py.
+PUERTO=8765
 
 echo "=== Buscador en videos de YouTube ==="
 echo

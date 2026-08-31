@@ -40,6 +40,11 @@ aparece solo en el navegador. Cuando terminaste, cerrá la ventana negra.
   No hace falta escribir nada en el campo de búsqueda, y respeta el tilde de IA: si
   está marcado, te muestra la transcripción de whisperx en vez de los subtítulos.
 
+- **Te avisa cuando el texto no es de fiar.** Arriba de los resultados, al lado del
+  título, aparece una advertencia si los subtítulos son una traducción automática (los
+  tiempos están bien, pero las palabras no son las que se dijeron) o si no se pudieron
+  refrescar y salieron del caché guardado.
+
 - **Busca sobre los subtítulos automáticos de YouTube**, que no son perfectos. Si YouTube
   entendió mal una palabra —pasa seguido con nombres propios y apellidos— esa palabra no
   se va a encontrar. Si no aparece algo que jurás que se dijo, probá con otra palabra de
@@ -79,9 +84,6 @@ cambia cómo se arman los cues se rehacen solos, sin volver a transcribir.
 
 Escucha solo en `127.0.0.1:8765` y además rechaza los pedidos que no vengan de esa misma
 página, así que ninguna web que visites puede hacerlo trabajar por atrás.
-
-Se puede cambiar con dos variables de entorno: `BUSCAR_PUERTO` y `BUSCAR_IDIOMA` (por
-defecto `es`; de ahí salen tanto la pista de subtítulos como el idioma de whisperx).
 
 ```
 app.py                  servidor y lógica

@@ -9,7 +9,9 @@ python3 -m unittest test_app  sin instalar nada.
 import json
 import os
 import shutil
+import subprocess
 import tempfile
+import time
 import unittest
 
 import app
@@ -172,6 +174,65 @@ class ParsearVtt(unittest.TestCase):
         contenido = vtt("00:00:05.000 --> 00:00:09.000\nLa noche larga")
         self.assertEqual(app.parsear_vtt(contenido), [(5, "La noche larga")])
 
+    def test_el_rollup_conserva_el_timing_por_palabra(self):
+        # El cue nuevo reescribe el texto viejo sin tags y le agrega una palabra. Antes
+        # la fusion se quedaba con esa version sin tags y las tres primeras palabras
+        # colapsaban en el segundo 0, justo lo que este modo viene a evitar.
+        contenido = vtt(
+            "00:00:00.030 --> 00:00:03.000\n"
+            "hola<00:00:01.500><c> a</c><00:00:02.400><c> todos</c>",
+            "00:00:03.000 --> 00:00:06.000\n"
+            "hola a todos<00:00:04.500><c> bienvenidos</c>",
+        )
+        self.assertEqual(app.parsear_vtt(contenido), [
+            (0, "hola"), (1, "a"), (2, "todos"), (4, "bienvenidos"),
+        ])
+
+    def test_note_hablado_adentro_de_un_cue_entra_al_indice(self):
+        # El filtro de encabezados aplicaba a todo el archivo y se comia la linea.
+        contenido = vtt("00:00:01.000 --> 00:00:02.000\nNOTE que esto es importante")
+        self.assertEqual(app.parsear_vtt(contenido),
+                         [(1, "NOTE que esto es importante")])
+
+    def test_note_estructural_sigue_afuera(self):
+        # Como bloque propio, separado por lineas en blanco, si es del formato.
+        contenido = vtt(
+            "00:00:01.000 --> 00:00:02.000\nhola",
+            "NOTE esto es un comentario del archivo",
+            "00:00:05.000 --> 00:00:06.000\nchau",
+        )
+        self.assertEqual(app.parsear_vtt(contenido), [(1, "hola"), (5, "chau")])
+
+    def test_cues_pegados_no_pierden_su_ultima_linea(self):
+        # Sin linea en blanco de por medio, "primera" parecia un identificador de cue.
+        contenido = ("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nprimera\n"
+                     "00:00:05.000 --> 00:00:06.000\nsegunda\n")
+        self.assertEqual(app.parsear_vtt(contenido), [(1, "primera"), (5, "segunda")])
+
+    def test_identificadores_de_cue_siguen_afuera(self):
+        contenido = vtt("7\n00:00:01.000 --> 00:00:02.000\nuno")
+        self.assertEqual(app.parsear_vtt(contenido), [(1, "uno")])
+
+
+class PistaDeSubtitulos(unittest.TestCase):
+    def test_prefiere_la_transcripcion_real(self):
+        archivos = ["vid.es.vtt", "vid.es-orig.vtt"]
+        self.assertEqual(app._elegir_sub(archivos, "vid"), ("vid.es-orig.vtt", "es-orig"))
+
+    def test_una_variante_suelta_se_marca_como_traduccion(self):
+        # "es-419" en un video hablado en ingles es una traduccion automatica: los
+        # tiempos estan bien pero las palabras no son las que se dijeron.
+        archivo, idioma = app._elegir_sub(["vid.es-419.vtt"], "vid")
+        self.assertEqual((archivo, idioma), ("vid.es-419.vtt", "es-419"))
+        self.assertIn("traducidos", app._aviso_de(idioma))
+
+    def test_la_pista_buena_no_avisa_nada(self):
+        self.assertIsNone(app._aviso_de("es-orig"))
+        self.assertIsNone(app._aviso_de("es"))
+
+    def test_el_cache_vencido_avisa(self):
+        self.assertIn("no pude refrescarlos", app._aviso_de("es", vencido=True))
+
 
 class Buscar(unittest.TestCase):
     def test_consulta_vacia(self):
@@ -330,6 +391,33 @@ class CacheWhisper(unittest.TestCase):
         self.assertIsNone(app._leer_cache_whisper("vid"))
 
 
+class CacheSubtitulos(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.mkdtemp()
+        previo, app.CACHE = app.CACHE, tmp
+        self.addCleanup(setattr, app, "CACHE", previo)
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+
+    def test_devuelve_titulo_e_idioma(self):
+        app._guardar_cache("vid.vtt", "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhola\n")
+        app._guardar_cache("vid.meta.json",
+                           json.dumps({"titulo": "Un video", "idioma": "es-orig"}))
+        contenido, titulo, idioma = app._leer_cache("vid")
+        self.assertIn("hola", contenido)
+        self.assertEqual((titulo, idioma), ("Un video", "es-orig"))
+
+    def test_sin_metadata_se_rebaja(self):
+        # No saber de que pista salio el vtt es no saber si es lo que se dijo o una
+        # traduccion: se prefiere rebajarlo antes que mostrarlo sin la advertencia.
+        app._guardar_cache("vid.vtt", "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhola\n")
+        self.assertIsNone(app._leer_cache("vid"))
+
+    def test_vtt_vacio_no_cuenta(self):
+        app._guardar_cache("vid.vtt", "   \n")
+        app._guardar_cache("vid.meta.json", json.dumps({"titulo": "x", "idioma": "es"}))
+        self.assertIsNone(app._leer_cache("vid"))
+
+
 class CarpetaTemporal(unittest.TestCase):
     def test_se_borra_sola_al_salir(self):
         with app._carpeta_temporal() as tmp:
@@ -343,9 +431,38 @@ class CarpetaTemporal(unittest.TestCase):
         with app._carpeta_temporal() as tmp:
             open(os.path.join(tmp, "audio.wav"), "w").close()
             self.assertIn(tmp, app._TEMPORALES)
-            app._terminar_hijos()
+            app._terminar_hijos()          # sin argumentos no llama a sys.exit
             self.assertFalse(os.path.exists(tmp))
         self.assertNotIn(tmp, app._TEMPORALES)
+
+
+class ProcesosHijos(unittest.TestCase):
+    def test_el_timeout_no_se_cuelga_esperando_a_un_nieto(self):
+        # yt-dlp lanza ffmpeg y le pasa sus pipes. Matando solo al padre, ffmpeg
+        # mantenia abierto el stderr heredado y el communicate() de despues esperaba
+        # un EOF que no llegaba nunca: el thread del pedido quedaba colgado.
+        arranque = time.monotonic()
+        with self.assertRaises(app.ErrorDeUso):
+            app._correr(["/bin/sh", "-c", "sleep 30 & sleep 30"], 1, "tardo demasiado")
+        self.assertLess(time.monotonic() - arranque, 10)
+
+    def test_al_salir_se_lleva_al_nieto(self):
+        proceso = subprocess.Popen(
+            ["/bin/sh", "-c", "sleep 30 & echo $!; sleep 30"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        self.addCleanup(app._matar, proceso)
+        nieto = int(proceso.stdout.readline())
+        app._matar(proceso)
+        proceso.communicate(timeout=5)
+        # Si el nieto sobrevivio, sigue comiendose los cores sin ventana que lo delate.
+        for _ in range(50):
+            if subprocess.run(["kill", "-0", str(nieto)],
+                              capture_output=True).returncode != 0:
+                return
+            time.sleep(0.1)
+        self.fail("el nieto %d quedo vivo" % nieto)
 
 
 class Formatear(unittest.TestCase):
