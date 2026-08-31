@@ -59,6 +59,16 @@
     cursor: pointer;
   }
   button:disabled { opacity: .55; cursor: default; }
+  /* Secundario: no compite con Buscar, que es la acción principal. */
+  button.secundario {
+    justify-self: start;
+    padding: .3rem 0;
+    font-size: .9rem;
+    font-weight: 500;
+    color: var(--acento);
+    background: none;
+    text-decoration: underline;
+  }
   #estado { margin: 1.5rem 0 0; color: var(--tenue); }
   #estado.error { color: var(--acento); }
   #titulo { margin: 1.75rem 0 .75rem; font-size: .9rem; color: var(--tenue); }
@@ -90,6 +100,16 @@
     font-size: .9rem;
   }
   label.opcion input { width: auto; padding: 0; }
+  /* Le da nombre accesible a los campos sin agregar texto visible: el placeholder
+     desaparece al tipear y un lector de pantalla se queda sin saber qué es cada uno. */
+  .oculto {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
   @media (max-width: 30rem) {
     a.resultado { grid-template-columns: 1fr; gap: .3rem; }
   }
@@ -101,9 +121,14 @@
   <p class="sub">Pegá el link de un video de YouTube y buscá una palabra o una frase.</p>
 
   <form id="form">
-    <input id="url" type="url" required placeholder="https://www.youtube.com/watch?v=..."
+    <label class="oculto" for="url">Link del video de YouTube</label>
+    <!-- type="text" y no "url": el servidor también acepta el id pelado de 11
+         caracteres, y con type="url" el navegador lo rechazaba antes de mandarlo. -->
+    <input id="url" type="text" inputmode="url" required
+           placeholder="https://www.youtube.com/watch?v=..."
            autocomplete="off" spellcheck="false">
     <div class="fila">
+      <label class="oculto" for="consulta">Palabra o frase a buscar</label>
       <input id="consulta" type="text" required placeholder="palabra o frase a buscar"
              autocomplete="off">
       <button id="boton" type="submit">Buscar</button>
@@ -111,11 +136,14 @@
     <label class="opcion">
       <input id="forzar_whisper" type="checkbox">
       Transcribir el audio con IA (WhisperX) — más lento, pero encuentra nombres propios
-      y marca el segundo exacto
+      que YouTube escribió mal
     </label>
+    <!-- type="button": no dispara la validación del campo de búsqueda, que para ver
+         la transcripción no hace falta llenar. -->
+    <button id="ver_todo" type="button" class="secundario">Ver toda la transcripción</button>
   </form>
 
-  <p id="estado"></p>
+  <p id="estado" aria-live="polite"></p>
   <p id="titulo" hidden></p>
   <ol id="resultados"></ol>
 </main>
@@ -127,9 +155,15 @@
   const titulo = document.getElementById("titulo");
   const lista = document.getElementById("resultados");
   const forzar = document.getElementById("forzar_whisper");
+  const botonTodo = document.getElementById("ver_todo");
+  const campoUrl = document.getElementById("url");
+  const campoConsulta = document.getElementById("consulta");
 
   // La primera busqueda de un video baja el texto; las siguientes salen del cache.
+  // Se indexa por el video_id que devuelve el servidor y no por la URL tipeada: asi
+  // pegar youtu.be/X despues de youtube.com/watch?v=X no vuelve a mostrar la espera.
   const vistos = new Set();
+  const idsPorUrl = new Map();
 
   function cronometro(mensaje) {
     const arranque = Date.now();
@@ -143,22 +177,55 @@
     return setInterval(pintar, 1000);
   }
 
-  form.addEventListener("submit", async (evento) => {
-    evento.preventDefault();
-    const url = document.getElementById("url").value.trim();
-    const consulta = document.getElementById("consulta").value.trim();
+  function pintar(items) {
+    const trozo = document.createDocumentFragment();
+    for (const item of items) {
+      const enlace = document.createElement("a");
+      enlace.className = "resultado";
+      enlace.href = item.link;
+      enlace.target = "_blank";
+      enlace.rel = "noopener";
+
+      const marca = document.createElement("span");
+      marca.className = "marca";
+      marca.textContent = item.timestamp;
+
+      const cita = document.createElement("span");
+      cita.className = "cita";
+      cita.textContent = item.texto;
+
+      enlace.append(marca, cita);
+      const fila = document.createElement("li");
+      fila.append(enlace);
+      trozo.append(fila);
+    }
+    lista.append(trozo);
+  }
+
+  // Las dos rutas devuelven `resultados` con la misma forma, así que se pintan igual.
+  // consulta === null significa "mostrame la transcripción entera".
+  async function ejecutar(ruta, consulta) {
+    const url = campoUrl.value.trim();
+    if (!url) {
+      estado.className = "error";
+      estado.textContent = "Pegá primero el link de un video de YouTube.";
+      campoUrl.focus();
+      return;
+    }
     const forzarWhisper = forzar.checked;
-    const clave = url + (forzarWhisper ? "|ia" : "|subs");
+    const modo = forzarWhisper ? "ia" : "subs";
+    const yaBajado = idsPorUrl.has(url) && vistos.has(idsPorUrl.get(url) + "|" + modo);
 
     lista.replaceChildren();
     titulo.hidden = true;
     estado.className = "";
     boton.disabled = true;
+    botonTodo.disabled = true;
 
     // Transcribir baja el audio entero y lo pasa por el modelo: son minutos, no segundos.
     let tic = null;
-    if (vistos.has(clave)) {
-      estado.textContent = "Buscando…";
+    if (yaBajado) {
+      estado.textContent = consulta === null ? "Armando la transcripción…" : "Buscando…";
     } else if (forzarWhisper) {
       tic = cronometro("Transcribiendo el audio con IA, esto tarda varios minutos…");
     } else {
@@ -166,66 +233,82 @@
     }
 
     try {
-      const respuesta = await fetch("/api/buscar", {
+      const respuesta = await fetch(ruta, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url,
-          consulta,
-          forzar_whisper: forzarWhisper,
-        }),
+        body: JSON.stringify({ url, consulta, forzar_whisper: forzarWhisper }),
       });
-      const datos = await respuesta.json();
+      let datos;
+      try {
+        datos = await respuesta.json();
+      } catch {
+        // Un 500 con traceback, o el servidor caido a mitad: sin esto el usuario
+        // veia "Unexpected token '<' in JSON at position 0".
+        throw new Error(
+          "El servidor respondió algo que no entiendo. " +
+          "Fijate si hay un error en la ventana de Terminal."
+        );
+      }
       if (!respuesta.ok) throw new Error(datos.error || "Algo falló.");
 
       clearInterval(tic);
       tic = null;
-      vistos.add(clave);
-      titulo.textContent = datos.fuente === "whisperx"
-        ? `${datos.titulo} — transcripción con IA`
-        : datos.titulo;
+      idsPorUrl.set(url, datos.video_id);
+      vistos.add(datos.video_id + "|" + modo);
+      // El aviso es lo que el servidor no puede decir con los resultados: que los
+      // subtítulos salieron del caché viejo, o que son una traducción automática y
+      // las palabras pueden no ser las que se dijeron.
+      const notas = [];
+      if (datos.fuente === "whisperx") notas.push("transcripción con IA");
+      if (datos.aviso) notas.push(datos.aviso);
+      titulo.textContent = [datos.titulo, ...notas].join(" — ");
       titulo.hidden = false;
 
       if (!datos.resultados.length) {
-        estado.textContent = `No aparece “${consulta}” en este video.`;
+        estado.textContent = consulta === null
+          ? "Este video no tiene texto para mostrar."
+          : `No aparece “${consulta}” en este video.`;
         return;
       }
 
       const cantidad = datos.resultados.length;
-      const aproximado = datos.resultados.some((item) => item.aproximado);
-      estado.textContent = aproximado
-        ? `No aparece “${consulta}” tal cual, pero sí algo muy parecido ` +
-          `(${cantidad} ${cantidad === 1 ? "resultado" : "resultados"}):`
-        : `${cantidad} ${cantidad === 1 ? "resultado" : "resultados"}:`;
-
-      for (const item of datos.resultados) {
-        const enlace = document.createElement("a");
-        enlace.className = "resultado";
-        enlace.href = item.link;
-        enlace.target = "_blank";
-        enlace.rel = "noopener";
-
-        const marca = document.createElement("span");
-        marca.className = "marca";
-        marca.textContent = item.timestamp;
-
-        const cita = document.createElement("span");
-        cita.className = "cita";
-        cita.textContent = item.texto;
-
-        enlace.append(marca, cita);
-        const fila = document.createElement("li");
-        fila.append(enlace);
-        lista.append(fila);
+      const total = datos.total || cantidad;
+      if (consulta === null) {
+        estado.textContent =
+          `Transcripción completa, ${cantidad} ${cantidad === 1 ? "bloque" : "bloques"}. ` +
+          `Tocá cualquiera para abrir el video en ese momento:`;
+      } else {
+        const aproximado = datos.resultados.some((item) => item.aproximado);
+        // El servidor corta la lista para no colgar al navegador, pero cuenta todas:
+        // decir cuántas hay evita que parezca que aparece 200 veces justas.
+        const cuenta = total > cantidad
+          ? `${total} resultados, muestro los primeros ${cantidad}`
+          : `${cantidad} ${cantidad === 1 ? "resultado" : "resultados"}`;
+        estado.textContent = aproximado
+          ? `No aparece “${consulta}” tal cual, pero sí algo muy parecido (${cuenta}):`
+          : `${cuenta}:`;
       }
+
+      pintar(datos.resultados);
     } catch (error) {
       estado.className = "error";
-      estado.textContent = error.message;
+      // Un TypeError acá es siempre el fetch que no llegó a ningún lado.
+      estado.textContent = error instanceof TypeError
+        ? "Se cortó la conexión con el buscador. ¿Seguís teniendo abierta la ventana de Terminal?"
+        : error.message;
     } finally {
       clearInterval(tic);
       boton.disabled = false;
+      botonTodo.disabled = false;
     }
+  }
+
+  form.addEventListener("submit", (evento) => {
+    evento.preventDefault();
+    ejecutar("/api/buscar", campoConsulta.value.trim());
   });
+
+  botonTodo.addEventListener("click", () => ejecutar("/api/transcripcion", null));
 </script>
 </body>
 </html>
