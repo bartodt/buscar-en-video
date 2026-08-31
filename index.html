@@ -13,6 +13,7 @@
     --tenue: #6b6b73;
     --borde: #dededf;
     --acento: #c8102e;
+    --marca: #ffd9df;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -22,6 +23,7 @@
       --tenue: #9a9aa3;
       --borde: #34343a;
       --acento: #ff5a72;
+      --marca: #5a2430;
     }
   }
   * { box-sizing: border-box; }
@@ -72,7 +74,33 @@
   }
   #estado { margin: 1.5rem 0 0; color: var(--tenue); }
   #estado.error { color: var(--acento); }
-  #titulo { margin: 1.75rem 0 .75rem; font-size: .9rem; color: var(--tenue); }
+  /* La respuesta que se vino a buscar es el número, no la lista: va primero y grande.
+     Antes vivía dentro de la misma frase gris que los mensajes de progreso. */
+  #resumen { margin: 2rem 0 1rem; }
+  .cuenta {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: .5rem;
+    margin: 0;
+  }
+  .cuenta b {
+    font-size: 3rem;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    color: var(--acento);
+  }
+  .cuenta span { font-size: 1.1rem; }
+  #titulo, #detalle { margin: .5rem 0 0; font-size: .9rem; color: var(--tenue); }
+  #copiar { margin-top: .75rem; }
+  #copiar.listo { color: var(--tenue); text-decoration: none; }
+  mark {
+    background: var(--marca);
+    color: inherit;
+    font-weight: 600;
+    border-radius: .2rem;
+    padding: 0 .1em;
+  }
   ol { list-style: none; margin: 0; padding: 0; display: grid; gap: .5rem; }
   a.resultado {
     display: grid;
@@ -93,6 +121,13 @@
     color: var(--acento);
   }
   .cita { color: var(--texto); }
+  .menciones {
+    display: block;
+    margin-top: .15rem;
+    font-size: .75rem;
+    font-weight: 500;
+    color: var(--tenue);
+  }
   label.opcion {
     display: flex;
     align-items: center;
@@ -145,7 +180,14 @@
   </form>
 
   <p id="estado" aria-live="polite"></p>
-  <p id="titulo" hidden></p>
+
+  <section id="resumen" aria-live="polite" hidden>
+    <p class="cuenta"><b id="numero"></b> <span id="leyenda"></span></p>
+    <p id="detalle" hidden></p>
+    <p id="titulo"></p>
+    <button id="copiar" type="button" class="secundario">Copiar resultados</button>
+  </section>
+
   <ol id="resultados"></ol>
 
   <!-- La app no tiene ventana propia ni icono en el Dock: este botón es la única
@@ -165,6 +207,14 @@
   const botonTodo = document.getElementById("ver_todo");
   const campoUrl = document.getElementById("url");
   const campoConsulta = document.getElementById("consulta");
+  const resumen = document.getElementById("resumen");
+  const numero = document.getElementById("numero");
+  const leyenda = document.getElementById("leyenda");
+  const detalle = document.getElementById("detalle");
+  const botonCopiar = document.getElementById("copiar");
+
+  // Lo último que se mostró, tal cual se pintó: es lo que copia el botón.
+  let ultimo = null;
 
   // La primera busqueda de un video baja el texto; las siguientes salen del cache.
   // Se indexa por el video_id que devuelve el servidor y no por la URL tipeada: asi
@@ -204,6 +254,28 @@
     return setInterval(consultar, 1000);
   }
 
+  // El servidor manda en `marcas` dónde cae cada mención dentro del fragmento, en
+  // orden y sin pisarse. Se arma con nodos de texto y no con innerHTML: el texto
+  // viene de la transcripción de un video cualquiera y meterlo como HTML sería
+  // confiar en que nadie diga "<script>".
+  function cita(texto, marcas) {
+    const trozo = document.createDocumentFragment();
+    let cursor = 0;
+    for (const marca of Array.isArray(marcas) ? marcas : []) {
+      const [inicio, fin] = Array.isArray(marca) ? marca : [];
+      // Índices que no cierran, o que se van para atrás: se sigue de largo y esa
+      // mención queda sin resaltar. Un resaltado corrido es peor que ninguno.
+      if (!(Number.isInteger(inicio) && Number.isInteger(fin)
+            && inicio >= cursor && inicio < fin && fin <= texto.length)) continue;
+      const resaltado = document.createElement("mark");
+      resaltado.textContent = texto.slice(inicio, fin);
+      trozo.append(texto.slice(cursor, inicio), resaltado);
+      cursor = fin;
+    }
+    trozo.append(texto.slice(cursor));
+    return trozo;
+  }
+
   function pintar(items) {
     const trozo = document.createDocumentFragment();
     for (const item of items) {
@@ -216,18 +288,82 @@
       const marca = document.createElement("span");
       marca.className = "marca";
       marca.textContent = item.timestamp;
+      // Una tarjeta puede juntar varias menciones seguidas. Sin este número, dos
+      // tarjetas con distinta cantidad de resaltados se ven igual de lejos y no
+      // cierran contra el total de arriba.
+      if (item.menciones > 1) {
+        const cuantas = document.createElement("small");
+        cuantas.className = "menciones";
+        cuantas.textContent = `${item.menciones} menciones`;
+        marca.append(cuantas);
+      }
 
-      const cita = document.createElement("span");
-      cita.className = "cita";
-      cita.textContent = item.texto;
+      const texto = document.createElement("span");
+      texto.className = "cita";
+      texto.append(cita(item.texto, item.marcas));
 
-      enlace.append(marca, cita);
+      enlace.append(marca, texto);
       const fila = document.createElement("li");
       fila.append(enlace);
       trozo.append(fila);
     }
     lista.append(trozo);
   }
+
+  // La respuesta que el cliente vino a buscar es "cuántas veces", no la lista: va
+  // arriba y en grande, incluso cuando la respuesta es cero. Cero también es un dato
+  // que se reporta, así que se muestra igual que cualquier otro y no como un error.
+  function mostrar(cuenta, texto, aviso, datos, notas) {
+    numero.textContent = cuenta;
+    leyenda.textContent = texto;
+    detalle.textContent = aviso;
+    detalle.hidden = !aviso;
+    titulo.textContent = [datos.titulo, ...notas].join(" — ");
+    botonCopiar.textContent = "Copiar resultados";
+    botonCopiar.className = "secundario";
+    resumen.hidden = false;
+    ultimo = {
+      encabezado: `${cuenta} ${texto}`,
+      aviso,
+      titulo: titulo.textContent,
+      filas: datos.resultados,
+    };
+  }
+
+  // Esto no se mira y se olvida: se pega en un mail o en una planilla. Las filas van
+  // separadas por tabuladores para que caigan en columnas al pegarlas en Excel y
+  // sigan leyéndose como texto corrido en cualquier otro lado. La columna de
+  // menciones no es decorativa: una fila puede valer por tres, y sin ella sumar los
+  // renglones en la planilla daría menos que el total del encabezado.
+  function paraCopiar() {
+    const lineas = [ultimo.encabezado];
+    if (ultimo.aviso) lineas.push(ultimo.aviso);
+    if (ultimo.titulo) lineas.push(ultimo.titulo);
+    lineas.push("");
+    lineas.push(["Momento", "Menciones", "Lo que se dijo", "Link"].join("\t"));
+    for (const item of ultimo.filas) {
+      lineas.push([item.timestamp, item.menciones || 1, item.texto, item.link].join("\t"));
+    }
+    return lineas.join("\n");
+  }
+
+  botonCopiar.addEventListener("click", async () => {
+    if (!ultimo) return;
+    try {
+      await navigator.clipboard.writeText(paraCopiar());
+      botonCopiar.textContent = "¡Copiado!";
+    } catch {
+      // El navegador puede negar el portapapeles. Antes que quedarse mudo, se
+      // selecciona el resumen entero para que se pueda copiar con Cmd+C a mano.
+      const rango = document.createRange();
+      rango.selectNodeContents(document.querySelector("main"));
+      const seleccion = getSelection();
+      seleccion.removeAllRanges();
+      seleccion.addRange(rango);
+      botonCopiar.textContent = "No me dejaron copiar — quedó seleccionado, hacé Cmd+C";
+    }
+    botonCopiar.className = "secundario listo";
+  });
 
   // Las dos rutas devuelven `resultados` con la misma forma, así que se pintan igual.
   // consulta === null significa "mostrame la transcripción entera".
@@ -244,7 +380,8 @@
     const yaBajado = idsPorUrl.has(url) && vistos.has(idsPorUrl.get(url) + "|" + modo);
 
     lista.replaceChildren();
-    titulo.hidden = true;
+    resumen.hidden = true;
+    ultimo = null;
     estado.className = "";
     boton.disabled = true;
     botonTodo.disabled = true;
@@ -288,32 +425,30 @@
       const notas = [];
       if (datos.fuente === "whisperx") notas.push("transcripción con IA");
       if (datos.aviso) notas.push(datos.aviso);
-      titulo.textContent = [datos.titulo, ...notas].join(" — ");
-      titulo.hidden = false;
-
-      if (!datos.resultados.length) {
-        estado.textContent = consulta === null
-          ? "Este video no tiene texto para mostrar."
-          : `No aparece “${consulta}” en este video.`;
-        return;
-      }
+      // El progreso ya no tiene nada que decir: la respuesta está en el resumen.
+      estado.textContent = "";
 
       const cantidad = datos.resultados.length;
       const total = datos.total || cantidad;
       if (consulta === null) {
-        estado.textContent =
-          `Transcripción completa, ${cantidad} ${cantidad === 1 ? "bloque" : "bloques"}. ` +
-          `Tocá cualquiera para abrir el video en ese momento:`;
+        mostrar(cantidad, cantidad === 1 ? "bloque de transcripción" : "bloques de transcripción",
+                cantidad
+                  ? "Tocá cualquiera para abrir el video en ese momento."
+                  : "Este video no tiene texto para mostrar.",
+                datos, notas);
       } else {
-        const aproximado = datos.resultados.some((item) => item.aproximado);
+        const avisos = [];
+        if (datos.resultados.some((item) => item.aproximado)) {
+          avisos.push(`No aparece “${consulta}” tal cual, pero sí algo muy parecido.`);
+        }
         // El servidor corta la lista para no colgar al navegador, pero cuenta todas:
-        // decir cuántas hay evita que parezca que aparece 200 veces justas.
-        const cuenta = total > cantidad
-          ? `${total} resultados, muestro los primeros ${cantidad}`
-          : `${cantidad} ${cantidad === 1 ? "resultado" : "resultados"}`;
-        estado.textContent = aproximado
-          ? `No aparece “${consulta}” tal cual, pero sí algo muy parecido (${cuenta}):`
-          : `${cuenta}:`;
+        // el número grande es el total, y acá se aclara que la lista quedó cortada.
+        // `cantidad` son tarjetas y `mostradas` son menciones: con el agrupado no
+        // son lo mismo, y lo que hay que decir acá es cuántas menciones se ven.
+        const mostradas = datos.resultados.reduce((suma, item) => suma + (item.menciones || 1), 0);
+        if (total > mostradas) avisos.push(`Abajo muestro las primeras ${mostradas}.`);
+        mostrar(total, `${total === 1 ? "vez" : "veces"} se dijo “${consulta}”`,
+                avisos.join(" "), datos, notas);
       }
 
       pintar(datos.resultados);

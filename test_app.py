@@ -258,18 +258,48 @@ class Buscar(unittest.TestCase):
         self.assertTrue(resultados and resultados[0]["aproximado"])
 
     def test_tope_de_resultados(self):
-        cues = [(i, "hola") for i in range(0, 3000, 2)]
+        # El tope se cuenta en tarjetas. Separadas por relleno largo no se agrupa
+        # ninguna, asi que hay una tarjeta por mencion y el tope se toca de lleno.
+        relleno = " ".join(["relleno"] * 12)
+        cues = [(i, "hola " + relleno) for i in range(300)]
         resultados, total = app.buscar(indice(cues), "hola", "x")
         self.assertEqual(len(resultados), app.MAX_RESULTADOS)
-        self.assertEqual(total, 1500)
+        self.assertEqual(total, 300)
 
-    def test_dos_frases_distintas_cercanas_no_colapsan(self):
-        # Antes _barrer deduplicaba por tiempo y se comia la segunda mencion. De las
-        # repeticiones de verdad se encarga parsear_vtt, no la busqueda.
+    def test_el_total_cuenta_menciones_aunque_la_lista_se_corte(self):
+        # Lo que el cliente vino a saber es el total, y ese no lo toca ni el tope de
+        # tarjetas ni el agrupado: pegadas se agrupan de a ocho y siguen siendo 1500.
+        cues = [(i, "hola") for i in range(0, 3000, 2)]
+        resultados, total = app.buscar(indice(cues), "hola", "x")
+        self.assertEqual(total, 1500)
+        self.assertLessEqual(len(resultados), app.MAX_RESULTADOS)
+        self.assertEqual(sum(r["menciones"] for r in resultados), 1500)
+        for r in resultados:
+            self.assertLessEqual(r["menciones"], app.MAX_MENCIONES_POR_TARJETA)
+
+    def test_dos_frases_cercanas_comparten_tarjeta_sin_perder_ninguna(self):
+        # Antes _barrer deduplicaba por tiempo y se comia la segunda mencion. Ahora
+        # las junta en una tarjeta, que es otra cosa: las dos siguen contadas y las
+        # dos siguen resaltadas. Lo que no puede volver a pasar es que el total baje.
         cues = [(10, "el perro corre"), (14, "un perro duerme")]
-        resultados, _ = app.buscar(indice(cues), "perro", "x")
+        resultados, total = app.buscar(indice(cues), "perro", "x")
+        self.assertEqual(total, 2)
+        self.assertEqual(len(resultados), 1)
+        tarjeta = resultados[0]
+        self.assertEqual(tarjeta["menciones"], 2)
+        self.assertEqual(tarjeta["timestamp"], "0:00:10")
+        self.assertEqual([tarjeta["texto"][i:f] for i, f in tarjeta["marcas"]],
+                         ["perro", "perro"])
+
+    def test_dos_frases_lejanas_no_comparten_tarjeta(self):
+        # Ojo: en caracteres estas dos SI se pisan, porque el texto corre pegado y el
+        # silencio de dos minutos no ocupa lugar. Las separa el corte por tiempo, que
+        # es el que evita que la tarjeta de 0:00:10 se trague el timestamp 0:02:10.
+        cues = [(10, "el perro corre"), (130, "un perro duerme")]
+        resultados, total = app.buscar(indice(cues), "perro", "x")
+        self.assertEqual(total, 2)
         self.assertEqual([r["timestamp"] for r in resultados],
-                         ["0:00:10", "0:00:14"])
+                         ["0:00:10", "0:02:10"])
 
     def test_sin_resultados(self):
         resultados, total = app.buscar(indice([(0, "hola")]), "murcielago", "x")
@@ -279,7 +309,9 @@ class Buscar(unittest.TestCase):
         # Avanzando de a un caracter, "jaja" entraba tres veces en "jajajaja" y
         # salian tres resultados identicos, con el mismo segundo y el mismo texto.
         resultados, total = app.buscar(indice([(10, "jajajaja")]), "jaja", "x")
-        self.assertEqual((len(resultados), total), (2, 2))
+        # Dos menciones, y pegadas como estan van a dar en la misma tarjeta.
+        self.assertEqual(total, 2)
+        self.assertEqual([r["menciones"] for r in resultados], [2])
 
     def test_el_contexto_no_corta_palabras_al_medio(self):
         # Palabras de largo fijo 7 para que los 60 caracteres de CONTEXTO caigan a
@@ -301,6 +333,44 @@ class Buscar(unittest.TestCase):
         for consulta in ("pop stars", "popstars"):
             resultados, _ = app.buscar(indice(cues), consulta, "x")
             self.assertIn("Pop stars", resultados[0]["texto"], consulta)
+
+    def test_la_marca_ubica_el_match_dentro_del_fragmento(self):
+        # El navegador resalta cortando el texto por estos dos indices, asi que tienen
+        # que caer exactamente sobre lo que matcheo: en las tres estrategias, y con el
+        # "…" del recorte y los espacios que se comieron al hacer strip ya contados.
+        relleno = "palabra de relleno " * 8
+        casos = (
+            ("presupuesto", "hablan del presupuesto anual", "presupuesto"),
+            ("popstars", "son unas Pop stars y siguen", "Pop stars"),
+            ("popstars", "una popstar de los noventa", "popstar"),
+            ("PRESUPUESTÓ", "hablan del Presupuesto anual", "Presupuesto"),
+        )
+        for consulta, frase, esperado in casos:
+            for cues in ([(10, frase)], [(10, relleno + frase + relleno)]):
+                resultados, _ = app.buscar(indice(cues), consulta, "x")
+                texto = resultados[0]["texto"]
+                self.assertEqual(resultados[0]["menciones"], 1)
+                inicio, fin = resultados[0]["marcas"][0]
+                self.assertEqual(texto[inicio:fin], esperado, (consulta, texto))
+
+    def test_la_transcripcion_no_trae_marcas(self):
+        bloques = app.transcripcion(indice([(30, "hola que tal")]), "abc")
+        self.assertNotIn("marcas", bloques[0])
+        self.assertNotIn("menciones", bloques[0])
+
+    def test_las_marcas_de_una_tarjeta_agrupada_van_en_orden_y_no_se_pisan(self):
+        # El navegador corta el fragmento con estos indices uno atras del otro: si
+        # vinieran desordenados o solapados, el resaltado saldria roto.
+        cues = [(i, p) for i, p in enumerate(
+            "digo Martita te dicen Martita y la Martita de siempre".split())]
+        resultados, total = app.buscar(indice(cues), "martita", "x")
+        self.assertEqual(total, 3)
+        self.assertEqual(len(resultados), 1)
+        marcas = resultados[0]["marcas"]
+        texto = resultados[0]["texto"]
+        self.assertEqual([texto[i:f] for i, f in marcas], ["Martita"] * 3)
+        for (_, fin_previo), (inicio, _) in zip(marcas, marcas[1:]):
+            self.assertLess(fin_previo, inicio)
 
     def test_consulta_que_no_es_texto(self):
         for consulta in (123, {"q": "x"}, ["x"], None):

@@ -1013,10 +1013,10 @@ def _barrer(aguja, pajar, mapa, completo, offsets, video_id, aproximado):
     diez segundos del anterior, y se llevaba puestas menciones reales: medido sobre
     un video de una hora, "que" pasaba de 200 menciones a 63.
 
-    Devuelve (resultados, total): se arman como mucho MAX_RESULTADOS, pero el total
-    se sigue contando para poder avisar que la lista quedo cortada.
+    Devuelve (resultados, total): cada resultado es una tarjeta, el total cuenta las
+    menciones una por una. No son lo mismo, ver _agrupar.
     """
-    resultados, desde, total = [], 0, 0
+    crudos, desde = [], 0
     while True:
         idx = pajar.find(aguja, desde)
         if idx == -1:
@@ -1028,41 +1028,99 @@ def _barrer(aguja, pajar, mapa, completo, offsets, video_id, aproximado):
         # En el modo comprimido el largo de la aguja no incluye los espacios que si
         # tiene el texto original, asi que el fin sale del mapa y no de una suma.
         real_fin = mapa[idx + len(aguja) - 1] + 1 if mapa else idx + len(aguja)
-        segundos = offsets[real]
-        total += 1
-        if len(resultados) >= MAX_RESULTADOS:
+        crudos.append((real, real_fin, offsets[real]))
+
+    resultados = [_tarjeta(grupo, completo, video_id, aproximado)
+                  for grupo in _agrupar(crudos)]
+    return resultados, len(crudos)
+
+
+# Cuando alguien repite una palabra, las menciones caen a menos de CONTEXTO caracteres
+# una de otra y las dos tarjetas terminan mostrando casi la misma frase, con el
+# resaltado en distinto lugar. En pantalla se lee como el mismo resultado repetido:
+# medido sobre una entrevista real, "Martita" daba cinco tarjetas que eran dos frases.
+# Ojo con lo que esto NO es: el filtro por tiempo que hubo aca antes descartaba
+# menciones y bajaba el total. Esto solo junta tarjetas, y el total no se toca.
+MAX_MENCIONES_POR_TARJETA = 8
+
+
+def _agrupar(crudos):
+    """Junta las menciones cuyos contextos se solapan. Corta en MAX_RESULTADOS grupos.
+
+    El tope se cuenta en tarjetas y no en menciones: es lo que evita que el navegador
+    tenga que pintar una lista infinita, y una tarjeta con ocho resaltados sigue
+    siendo una sola fila.
+    """
+    grupos = []
+    for mencion in crudos:
+        # Dos condiciones, y las dos hacen falta. La de caracteres es la que define el
+        # solape: el borde derecho de la tarjeta abierta es el fin de su ultima mencion
+        # mas el contexto, y si la que sigue arranca antes de ahi las frases se pisan.
+        # La de segundos es por los silencios: el texto de un video corre pegado aunque
+        # el video no, asi que dos menciones separadas por dos minutos de musica quedan
+        # a diez caracteres una de otra. Sin este corte la segunda perdia su timestamp
+        # adentro de la primera. Es el mismo motivo por el que agrupar() corta ahi.
+        if (grupos and len(grupos[-1]) < MAX_MENCIONES_POR_TARJETA
+                and mencion[0] <= grupos[-1][-1][1] + CONTEXTO
+                and mencion[2] - grupos[-1][0][2] <= SEGUNDOS_BLOQUE):
+            grupos[-1].append(mencion)
             continue
-
-        arranque = max(0, real - CONTEXTO)
-        fin = min(len(completo), real_fin + CONTEXTO)
-        # Correrse hasta el espacio mas cercano: cortar a mitad de palabra dejaba
-        # fragmentos como "…te larga que sirve para…" en vez de "…bastante larga…".
-        if arranque > 0:
-            espacio = completo.find(" ", arranque, real)
-            if espacio != -1:
-                arranque = espacio + 1
-        if fin < len(completo):
-            espacio = completo.rfind(" ", real_fin, fin)
-            if espacio != -1:
-                fin = espacio
-        fragmento = completo[arranque:fin].strip()
-        if arranque > 0:
-            fragmento = "…" + fragmento
-        if fin < len(completo):
-            fragmento = fragmento + "…"
-
-        resultados.append(_resultado(segundos, fragmento, video_id, aproximado))
-    return resultados, total
+        # El corte va despues de intentar sumar a la ultima: una mencion que pertenece
+        # a la tarjeta abierta entra igual, aunque ya no se puedan abrir mas.
+        if len(grupos) >= MAX_RESULTADOS:
+            break
+        grupos.append([mencion])
+    return grupos
 
 
-def _resultado(segundos, texto, video_id, aproximado=False):
-    return {
+def _tarjeta(grupo, completo, video_id, aproximado):
+    """El fragmento que rodea a un grupo de menciones, con cada una ubicada adentro."""
+    arranque = max(0, grupo[0][0] - CONTEXTO)
+    fin = min(len(completo), grupo[-1][1] + CONTEXTO)
+    # Correrse hasta el espacio mas cercano: cortar a mitad de palabra dejaba
+    # fragmentos como "…te larga que sirve para…" en vez de "…bastante larga…".
+    if arranque > 0:
+        espacio = completo.find(" ", arranque, grupo[0][0])
+        if espacio != -1:
+            arranque = espacio + 1
+    if fin < len(completo):
+        espacio = completo.rfind(" ", grupo[-1][1], fin)
+        if espacio != -1:
+            fin = espacio
+
+    crudo = completo[arranque:fin]
+    fragmento = crudo.strip()
+    # Donde cae cada mencion dentro del fragmento que se manda. El navegador las usa
+    # para resaltarlas sin tener que rehacer la busqueda: aca ya sabemos cual de las
+    # tres estrategias matcheo y hasta donde llego, y del otro lado no.
+    desplazamiento = -arranque - (len(crudo) - len(crudo.lstrip()))
+    if arranque > 0:
+        fragmento = "…" + fragmento
+        desplazamiento += 1
+    if fin < len(completo):
+        fragmento = fragmento + "…"
+    marcas = [[real + desplazamiento, real_fin + desplazamiento]
+              for real, real_fin, _segundos in grupo]
+    # El timestamp es el de la primera: es donde arranca lo que se ve en la tarjeta.
+    return _resultado(grupo[0][2], fragmento, video_id, aproximado, marcas)
+
+
+def _resultado(segundos, texto, video_id, aproximado=False, marcas=None):
+    resultado = {
         "segundos": int(segundos),
         "timestamp": formatear(segundos),
         "texto": texto,
         "link": "https://youtu.be/%s?t=%d" % (video_id, int(segundos)),
         "aproximado": aproximado,
     }
+    # Sólo cuando hay algo que resaltar: la transcripción completa no busca nada, y
+    # así sus bloques conservan exactamente la forma que tenían antes.
+    if marcas:
+        resultado["marcas"] = marcas
+        # Redundante con len(marcas), pero es el número que la tarjeta muestra y el
+        # que va a la columna de la planilla al copiar: mejor que sea explícito.
+        resultado["menciones"] = len(marcas)
+    return resultado
 
 
 def transcripcion(indice, video_id):
