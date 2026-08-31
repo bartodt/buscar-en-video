@@ -119,17 +119,39 @@ Si te avisó que ya existía: es una instalación anterior a medio hacer. Fijate
 `~/Applications/buscar-en-video/.venv/bin/whisperx --help` anda. Si anda, seguí desde el
 Paso 4 y listo. Si no anda o no está, borrá esa carpeta vieja (`rm -rf`) y repetí el `mv`.
 
-De acá en adelante, todo lo que sigue es sobre esta ruta nueva.
+### Ojo: el `mv` te mueve el piso a vos
+
+La carpeta donde estabas parado dejó de existir, y muchas herramientas de shell arrancan
+cada comando nuevo en el directorio original: la invocación siguiente te va a fallar con
+`No such file or directory` o con `shell-init: error retrieving current directory`, y el
+`cd` del bloque de arriba no sobrevive de un comando al otro. **Eso no es el ZIP roto ni el
+`mv` fallado**, y no lo diagnostiques como un problema de la instalación.
+
+De acá en adelante, empezá **cada** comando parándote de nuevo:
+
+```bash
+cd ~/Applications/buscar-en-video || exit 1
+```
+
+Todo lo que sigue es sobre esta ruta nueva.
 
 ## Paso 1 — Homebrew
 
-Primero fijate si ya está:
+Primero fijate si ya está. Que el chequeo **hable siempre**: si encadenás los `[ -x ]` con
+`||`, el comando sale con 0 y no imprime nada cuando brew existe, y "no imprimió nada" se
+lee igual que "no está" — terminás lanzando el instalador y pidiéndole la contraseña a la
+persona al vicio.
 
 ```bash
-[ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ] || command -v brew
+if BREW=$(command -v brew || ls /opt/homebrew/bin/brew /usr/local/bin/brew 2>/dev/null | head -1) && [ -n "$BREW" ]; then
+  echo "brew ya está en $BREW"
+else
+  echo "falta brew"
+fi
 ```
 
-Si aparece, saltá al Paso 2 (asegurándote antes de tenerlo en el PATH de tu sesión, abajo).
+Si dice que ya está, saltá al Paso 2 (asegurándote antes de tenerlo en el PATH de tu
+sesión, abajo).
 
 Si no aparece, **este es el único paso de toda la instalación que no podés hacer solo.**
 El instalador de Homebrew pide la contraseña de la Mac por `sudo`, y `sudo` exige una
@@ -175,17 +197,33 @@ La Terminal tarda unos segundos en aparecer. **Esperá a que la persona te confi
 terminó** —no sigas por tu cuenta— y después comprobalo vos:
 
 ```bash
-[ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ] && echo "brew instalado"
+if [ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ]; then
+  echo "brew instalado"
+else
+  echo "brew NO quedó instalado — algo salió mal en la ventana de la Terminal"
+fi
 ```
 
 Si la persona te dice que se equivocó de contraseña o que la ventana cerró con error,
 volvé a correr el mismo `open -a Terminal`: el instalador se puede repetir sin romper nada.
 
 Ya instalado, `brew` no está todavía en el PATH de *tu* sesión. Agregalo antes de seguir
-(la primera línea es Apple Silicon, la segunda Intel):
+(la primera rama es Apple Silicon, la segunda Intel).
+
+**No lo hagas con un `||` entre los dos `eval`.** Si la ruta de Apple Silicon no existe, la
+sustitución de comando queda vacía y `eval ""` **sale con 0**, así que el fallback de Intel
+no corre nunca: en una Mac Intel te quedás sin `brew` en el PATH y el Paso 2 muere con
+"command not found".
 
 ```bash
-eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || eval "$(/usr/local/bin/brew shellenv)"
+if [ -x /opt/homebrew/bin/brew ]; then
+  eval "$(/opt/homebrew/bin/brew shellenv)"
+elif [ -x /usr/local/bin/brew ]; then
+  eval "$(/usr/local/bin/brew shellenv)"
+else
+  echo "no encontré brew en ninguna de las dos rutas"
+fi
+command -v brew   # tiene que imprimir una ruta
 ```
 
 ## Paso 2 — Dependencias del sistema
@@ -199,12 +237,28 @@ brew install yt-dlp ffmpeg uv
   pero instalalo igual.
 - `uv` — arma el entorno de Python. Alternativa: `curl -LsSf https://astral.sh/uv/install.sh | sh`.
 
-Comprobá que `python3` exista (`command -v python3`). Sirve cualquier 3.8+; es solo para
-el servidor. Si no está, **instalalo con Homebrew**, que ya tenés del Paso 1 y no necesita
-que la persona haga nada:
+Falta `python3`, que es lo que corre el servidor. Sirve cualquier 3.8+.
+
+**No lo compruebes con `command -v python3`.** En una Mac sin las herramientas de línea de
+comandos de Xcode, `/usr/bin/python3` **existe igual**: es un stub de `xcrun` —el mismo
+binario que `/usr/bin/git` y `/usr/bin/clang`, comparten inodo— así que `command -v`
+devuelve 0 y vos concluís que hay Python donde no hay. Al invocarlo salta el diálogo
+gráfico de "instalar herramientas de línea de comandos", justo lo que acá abajo se te pide
+evitar.
+
+Instalalo con Homebrew, que ya tenés del Paso 1, no necesita que la persona haga nada, y
+te deja un `python3` propio que queda antes que el stub en el PATH:
 
 ```bash
 brew install python
+```
+
+Y comprobalo **corriéndolo**, no con `command -v`. Chequealo también en un login shell, que
+es el que va a usar el doble clic de `start.command`:
+
+```bash
+python3 -V                            # tiene que imprimir una versión, no un error
+zsh -lc 'command -v python3 && python3 -V'   # lo que va a ver el doble clic
 ```
 
 Evitá `xcode-select --install`: abre un diálogo gráfico que tenés que pedirle a la persona
@@ -280,9 +334,20 @@ igualmente inservible para la persona.
 
 ### 5.1 — Dependencias
 
+**No uses `command -v yt-dlp ffmpeg`**: con dos nombres devuelve 0 si encuentra
+**cualquiera** de los dos, así que te da "dependencias ok" con `ffmpeg` ausente y el modo IA
+muerto. Uno por uno:
+
 ```bash
-command -v yt-dlp ffmpeg && ./.venv/bin/whisperx --help >/dev/null && echo "dependencias ok"
+for b in yt-dlp ffmpeg; do
+  if command -v "$b" >/dev/null; then echo "ok: $b"; else echo "FALTA: $b"; fi
+done
+./.venv/bin/whisperx --help >/dev/null && echo "ok: whisperx"
 ```
+
+El `whisperx --help` puede tardar hasta unos 20 segundos la primera vez porque importa
+torch (después, con el caché caliente, son 3): no está colgado, y si tu herramienta de shell
+tiene un timeout corto, subilo para este comando.
 
 ### 5.2 — Tests del parseo y la búsqueda
 

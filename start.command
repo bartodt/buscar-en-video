@@ -38,6 +38,21 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   echo
 fi
 
+# Si ya hay otra ventana abierta, el puerto está tomado y el python que lancemos se muere
+# al instante. Hay que preguntarlo ANTES de lanzarlo: si no, el curl del loop de abajo le
+# pega al servidor de la otra ventana, gana la carrera y esta ventana te felicita justo
+# cuando no arrancó nada.
+if curl -fs "http://127.0.0.1:$PUERTO/api/salud" >/dev/null 2>&1; then
+  echo "Ya tenías el buscador abierto en otra ventana, así que no abro un segundo."
+  echo "Te lo abro en el navegador."
+  open "http://127.0.0.1:$PUERTO"
+  echo
+  echo "El motor es la otra ventana: no la cierres mientras lo usás."
+  echo
+  read -r -p "Enter para cerrar esta ventana."
+  exit 0
+fi
+
 python3 app.py &
 SERVIDOR=$!
 # Si cerrás esta ventana, el servidor se va con ella. El wait no es adorno: le da a
@@ -47,12 +62,13 @@ trap 'kill "$SERVIDOR" 2>/dev/null; wait "$SERVIDOR" 2>/dev/null' EXIT
 
 abierto=0
 for _ in $(seq 1 40); do
-  # Si el servidor murió al arrancar (el caso común: ya hay otra ventana abierta) hay
-  # que decirlo. Antes la ventana se cerraba sola y el error pasaba de largo.
+  # Si el servidor murió al arrancar hay que decirlo. Antes la ventana se cerraba sola y
+  # el error pasaba de largo. El caso de "ya hay otra ventana abierta" lo agarra el chequeo
+  # de salud de más arriba; acá llega lo demás: el puerto tomado por otro programa, o un
+  # python3 que no funciona.
   if ! kill -0 "$SERVIDOR" 2>/dev/null; then
     echo
     echo "El servidor no llegó a arrancar. El motivo está unas líneas más arriba."
-    echo "Lo más común es que ya tengas otra ventana del buscador abierta."
     echo
     read -r -p "Enter para cerrar."
     exit 1
