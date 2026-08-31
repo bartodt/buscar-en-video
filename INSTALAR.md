@@ -47,6 +47,13 @@ en `app.py`, que busca `./.venv/bin/whisperx` y si no está cae a `shutil.which`
   df -h .
   ```
 
+  La cuarta columna es lo libre. **Si quedan menos de 5 GB, no arranques**: la descarga de
+  1 GB del Paso 3 se corta a mitad y el `.venv` queda a medio instalar. Pará y decile esto:
+
+  > "Antes de seguir necesito que hagas lugar en el disco: la app ocupa unos 4 GB y ahora
+  > mismo no entran. Vaciá la Papelera y borrá videos o archivos grandes que no uses, y
+  > avisame cuando termines."
+
 ## Paso 0 — Pararte en la carpeta correcta
 
 Todo lo que sigue asume que estás **parado en la carpeta que contiene `app.py`**, y varios
@@ -89,12 +96,28 @@ binario **sigue existiendo** —así que `app.py` lo encuentra igual— pero exp
 verde con la IA rota. Mover ahora cuesta un segundo; mover después cuesta borrar el `.venv`
 y volver a bajar 1 GB.
 
+El destino es `~/Applications/buscar-en-video`. Usá ese nombre en inglés aunque el Finder
+de la persona esté en español: `~/Applications` es la carpeta que macOS ya muestra como
+"Aplicaciones", y si creás una `~/Aplicaciones` aparte la persona termina con dos carpetas
+que en pantalla se llaman igual.
+
+El `if` tampoco es adorno: si el destino ya existe (un intento anterior tuyo, por ejemplo)
+`mv` **no falla, mete la carpeta adentro** y todas las rutas de acá en adelante quedan mal.
+
 ```bash
-mkdir -p ~/Aplicaciones
-mv "$(pwd)" ~/Aplicaciones/buscar-en-video
-cd ~/Aplicaciones/buscar-en-video
+mkdir -p ~/Applications
+if [ -e ~/Applications/buscar-en-video ]; then
+  echo "OJO: ya hay algo en ~/Applications/buscar-en-video — no lo piso"
+else
+  mv "$(pwd)" ~/Applications/buscar-en-video
+fi
+cd ~/Applications/buscar-en-video
 pwd && ls app.py index.html start.command requirements.txt
 ```
+
+Si te avisó que ya existía: es una instalación anterior a medio hacer. Fijate si
+`~/Applications/buscar-en-video/.venv/bin/whisperx --help` anda. Si anda, seguí desde el
+Paso 4 y listo. Si no anda o no está, borrá esa carpeta vieja (`rm -rf`) y repetí el `mv`.
 
 De acá en adelante, todo lo que sigue es sobre esta ruta nueva.
 
@@ -115,15 +138,25 @@ esperando una contraseña que nadie va a poder escribir, hasta que se corte por 
 
 **Antes de lanzar nada**, decile a la persona exactamente esto:
 
-> "Voy a instalar una herramienta que la app necesita. Se va a abrir una ventana negra y
-> te va a pedir la contraseña de tu Mac —la misma que usás para desbloquearla—. Escribila
-> y apretá Enter.
+> "Voy a instalar una herramienta que la app necesita. Se va a abrir una ventana negra con
+> un montón de texto en inglés. Te va a pedir dos cosas, en este orden:
+>
+> **Primero, que aprietes Enter** para empezar (el texto dice algo como "press RETURN").
+> Apretá Enter y nada más.
+>
+> **Después, la contraseña de tu Mac** —la misma que usás para desbloquearla—. Escribila y
+> apretá Enter.
 >
 > Ojo con una cosa que asusta: **mientras escribís la contraseña no vas a ver nada en la
 > pantalla**, ni letras ni puntitos ni asteriscos. Es así a propósito, no está colgado.
 > Escribila igual y apretá Enter.
 >
 > Después dejá esa ventana quieta unos minutos hasta que deje de moverse, y avisame."
+
+Los dos prompts son del instalador oficial de Homebrew, en ese orden: primero
+`wait_for_user`, después el `sudo`. **No intentes saltear el Enter con `NONINTERACTIVE=1`**:
+en ese modo el instalador necesita un `sudo` sin contraseña o ya cacheado, y si no lo tiene
+aborta — terminás peor que antes.
 
 Recién ahí lanzalo en una Terminal propia, que es lo que le da el `sudo` su ventana:
 
@@ -231,8 +264,9 @@ en todo lo que salió adentro. Limpiar únicamente el lanzador deja marcados a `
 `index.html`, y el bloqueo reaparece igual. Sin esto, el primer doble clic lo frena
 Gatekeeper.
 
-El `chmod` es por las dudas: el ZIP de GitHub sí conserva el permiso de ejecución, pero se
-pierde si la carpeta viaja por mail o WhatsApp, y correrlo no cuesta nada.
+El `chmod` es por las dudas: el ZIP de GitHub **suele** conservar el permiso de ejecución,
+pero depende de con qué se descomprima, y se pierde seguro si la carpeta viajó por mail o
+WhatsApp. Correrlo no cuesta nada.
 
 Si aun así aparece el bloqueo, la persona tiene que hacer
 **clic derecho sobre `start.command` → Abrir → Abrir**, o autorizarlo en
@@ -278,19 +312,30 @@ curl -fs http://127.0.0.1:8765/api/salud
 Tiene que devolver `{"ok": true}` y además abrirse una pestaña del navegador. Si el
 `curl` anda pero la pestaña no aparece, revisá el Paso 4: casi siempre es cuarentena.
 
+**Este servidor tiene que seguir vivo para el 5.4.** Muchas herramientas de shell matan
+todo lo que dejaste en segundo plano al terminar cada comando, y entonces el 5.4 te va a
+dar "connection refused" y vas a diagnosticar mal. Si te pasa eso, no busques el problema
+en la instalación: corré el 5.3 y el 5.4 pegados, en **una sola** invocación de shell, o
+lanzá el servidor con `nohup ./start.command >/dev/null 2>&1 & disown`.
+
 ### 5.4 — Prueba real del modo subtítulos (la que decide)
 
-Con el servidor levantado del punto anterior:
+Con el servidor levantado del punto anterior. **No inventes un video de memoria**: hace
+falta uno con subtítulos automáticos **en español** (es el único idioma que pide la app), y
+si elegís uno en otro idioma vas a recibir "no tiene subtítulos en español" y creer que la
+instalación está rota. Dejá que `yt-dlp` te consiga uno:
 
 ```bash
+ID=$(yt-dlp --skip-download --print id "ytsearch1:entrevista completa en español" | head -1)
+echo "video elegido: $ID"
 curl -s -X POST http://127.0.0.1:8765/api/buscar \
   -H 'Content-Type: application/json' \
-  -d '{"url":"https://www.youtube.com/watch?v=VIDEO_ID","consulta":"una palabra que se diga"}'
+  -d "{\"url\":\"https://www.youtube.com/watch?v=$ID\",\"consulta\":\"que\"}"
 ```
 
-Usá un video con subtítulos automáticos **en español** (es el idioma que pide la app). Un
-video en otro idioma va a fallar por "no tiene subtítulos en español", y eso no es un
-problema de instalación.
+La consulta es `que` a propósito: es una palabra que aparece en cualquier video hablado en
+español, así que si no viene ningún resultado el problema es la instalación y no la
+elección de la palabra.
 
 Tiene que venir un JSON con `"fuente": "subtitulos"` y una lista de `resultados` no vacía.
 
@@ -338,7 +383,7 @@ La carpeta ya quedó en su lugar definitivo desde el Paso 0, así que acá no ha
 nada. Falta sólo el acceso en el Escritorio, que es por donde la persona la va a abrir:
 
 ```bash
-ln -sf ~/Aplicaciones/buscar-en-video/start.command ~/Desktop/"Buscar en video.command"
+ln -sf ~/Applications/buscar-en-video/start.command ~/Desktop/"Buscar en video.command"
 ```
 
 Es un enlace, no una copia, y el doble clic funciona igual: Finder lo resuelve antes de
@@ -354,9 +399,10 @@ Para cerrar, decile a la persona dónde quedó y cómo se abre:
 
 ## Cómo se usa después
 
-Doble clic en **`start.command`**. Se abre una ventana negra de Terminal (es el motor,
-tiene que quedar abierta) y el buscador aparece solo en el navegador, en
-`http://127.0.0.1:8765`. Para cerrarlo, se cierra la ventana negra.
+Doble clic en **Buscar en video**, el acceso del Escritorio (o en `start.command` dentro de
+la carpeta, es lo mismo). Se abre una ventana negra de Terminal (es el motor, tiene que
+quedar abierta) y el buscador aparece solo en el navegador, en `http://127.0.0.1:8765`.
+Para cerrarlo, se cierra la ventana negra.
 
 El detalle de la interfaz y de los dos modos está en el `README.md` de esta carpeta, que
 es lo único que la persona necesita leer.

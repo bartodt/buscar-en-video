@@ -8,13 +8,17 @@ minuto se dijo — con un link que abre el video justo en ese momento.
 
 ## Cómo se usa
 
-Doble clic en **`start.command`**.
+Doble clic en **Buscar en video**, el archivo que tenés en el Escritorio.
 
 Se abre una ventana negra de Terminal (dejala abierta, es el motor) y el buscador
-aparece solo en el navegador. Cuando terminaste, cerrá la ventana negra.
+aparece solo en el navegador. Cuando terminaste, cerrá la ventana negra. Si se te cierra
+sin querer, no pasa nada: doble clic de nuevo.
 
-> La primera vez que hacés doble clic, macOS puede desconfiar del archivo. Si pasa:
-> clic derecho sobre `start.command` → **Abrir** → **Abrir** de nuevo. Solo la primera vez.
+> Si alguna vez macOS desconfía del archivo y no lo abre: clic derecho sobre él →
+> **Abrir** → **Abrir** de nuevo.
+
+(El original vive en la carpeta `buscar-en-video`, dentro de Aplicaciones, y ahí el archivo
+se llama `start.command`. Da igual cuál de los dos abrís.)
 
 ## Cosas para saber
 
