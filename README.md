@@ -3,17 +3,6 @@
 Pegás el link de un video de YouTube, escribís una palabra o una frase, y te dice en qué
 minuto se dijo — con un link que abre el video justo en ese momento.
 
-## Primera vez
-
-Hace falta instalar **yt-dlp** una sola vez. Abrí la app **Terminal** y pegá esto:
-
-```bash
-brew install yt-dlp
-```
-
-Si te dice que no conoce el comando `brew`, instalá primero Homebrew desde
-[brew.sh](https://brew.sh) y después volvé a correr la línea de arriba.
-
 ## Cómo se usa
 
 Doble clic en **`start.command`**.

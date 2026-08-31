@@ -21,6 +21,20 @@ en `app.py`, que busca `./.venv/bin/whisperx` y si no está cae a `shutil.which`
 
 ## Antes de empezar
 
+- **Lo primero: confirmá que la máquina sea una Mac.**
+
+  ```bash
+  uname -s   # tiene que decir Darwin
+  ```
+
+  Todo lo que sigue es de macOS y no existe en otro lado: `brew`, `open`, `xattr` y el
+  propio `start.command`, que es un lanzador de doble clic de Finder. Si `uname -s` no
+  dice `Darwin` (o directamente estás en Windows), **no improvises un equivalente ni
+  instales nada**: pará acá y decile a la persona exactamente esto:
+
+  > "Esta app por ahora anda solo en Mac, y esta computadora no es una Mac. No hay nada
+  > roto ni hiciste nada mal. Avisale a quien te pasó la carpeta, que él va a saber."
+
 - **La carpeta `.venv` no viene incluida y no debe copiarse de otra Mac.** Pesa ~1 GB y
   los binarios adentro tienen rutas absolutas al usuario original. Hay que crearla acá.
 - Verificá la arquitectura (`uname -m`): `arm64` es Apple Silicon, `x86_64` es Intel. Los
@@ -30,16 +44,59 @@ en `app.py`, que busca `./.venv/bin/whisperx` y si no está cae a `shutil.which`
 
 ## Paso 1 — Homebrew
 
+Primero fijate si ya está:
+
 ```bash
-command -v brew || /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+[ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ] || command -v brew
 ```
 
-El instalador de Homebrew **pide la contraseña del usuario**. No la ejecutes vos a ciegas:
-avisale a la persona que va a aparecer ese pedido en la Terminal y que lo tiene que
-escribir ella. En Apple Silicon, después de instalar hay que agregar `brew` al PATH:
+Si aparece, saltá al Paso 2 (asegurándote antes de tenerlo en el PATH de tu sesión, abajo).
+
+Si no aparece, **este es el único paso de toda la instalación que no podés hacer solo.**
+El instalador de Homebrew pide la contraseña de la Mac por `sudo`, y `sudo` exige una
+terminal de verdad: si lo lanzás desde tu propia herramienta de shell se queda colgado
+esperando una contraseña que nadie va a poder escribir, hasta que se corte por timeout.
+
+**Antes de lanzar nada**, decile a la persona exactamente esto:
+
+> "Voy a instalar una herramienta que la app necesita. Se va a abrir una ventana negra y
+> te va a pedir la contraseña de tu Mac —la misma que usás para desbloquearla—. Escribila
+> y apretá Enter.
+>
+> Ojo con una cosa que asusta: **mientras escribís la contraseña no vas a ver nada en la
+> pantalla**, ni letras ni puntitos ni asteriscos. Es así a propósito, no está colgado.
+> Escribila igual y apretá Enter.
+>
+> Después dejá esa ventana quieta unos minutos hasta que deje de moverse, y avisame."
+
+Recién ahí lanzalo en una Terminal propia, que es lo que le da el `sudo` su ventana:
 
 ```bash
-eval "$(/opt/homebrew/bin/brew shellenv)"
+cat > /tmp/instalar-homebrew.sh <<'EOF'
+#!/bin/bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+echo
+echo "Listo. Ya podés volver con el asistente y cerrar esta ventana."
+EOF
+chmod +x /tmp/instalar-homebrew.sh
+open -a Terminal /tmp/instalar-homebrew.sh
+```
+
+La Terminal tarda unos segundos en aparecer. **Esperá a que la persona te confirme que
+terminó** —no sigas por tu cuenta— y después comprobalo vos:
+
+```bash
+[ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ] && echo "brew instalado"
+```
+
+Si la persona te dice que se equivocó de contraseña o que la ventana cerró con error,
+volvé a correr el mismo `open -a Terminal`: el instalador se puede repetir sin romper nada.
+
+Ya instalado, `brew` no está todavía en el PATH de *tu* sesión. Agregalo antes de seguir
+(la primera línea es Apple Silicon, la segunda Intel):
+
+```bash
+eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || eval "$(/usr/local/bin/brew shellenv)"
 ```
 
 ## Paso 2 — Dependencias del sistema
@@ -89,14 +146,23 @@ El resultado esperado es que exista `.venv/bin/whisperx`.
 
 ## Paso 4 — Permisos del lanzador
 
+Desde la carpeta del proyecto:
+
 ```bash
 chmod +x start.command
-xattr -d com.apple.quarantine start.command 2>/dev/null || true
+xattr -dr com.apple.quarantine . 2>/dev/null || true
 ```
 
-El `chmod` hace falta porque el permiso de ejecución se pierde al mandar la carpeta por
-mail o WhatsApp. El `xattr` saca la marca de cuarentena de macOS; sin eso, el primer doble
-clic lo bloquea Gatekeeper. Si aun así aparece el bloqueo, la persona tiene que hacer
+El `xattr` va **con `-r` y sobre la carpeta entera**, no sobre `start.command` solo: cuando
+el navegador baja el ZIP le pone la marca de cuarentena, y al descomprimir esa marca queda
+en todo lo que salió adentro. Limpiar únicamente el lanzador deja marcados a `app.py` y a
+`index.html`, y el bloqueo reaparece igual. Sin esto, el primer doble clic lo frena
+Gatekeeper.
+
+El `chmod` es por las dudas: el ZIP de GitHub sí conserva el permiso de ejecución, pero se
+pierde si la carpeta viaja por mail o WhatsApp, y correrlo no cuesta nada.
+
+Si aun así aparece el bloqueo, la persona tiene que hacer
 **clic derecho sobre `start.command` → Abrir → Abrir**, o autorizarlo en
 **Ajustes del Sistema → Privacidad y seguridad**.
 
