@@ -80,14 +80,14 @@ cambia cómo se arman los cues se rehacen solos, sin volver a transcribir.
 Escucha solo en `127.0.0.1:8765` y además rechaza los pedidos que no vengan de esa misma
 página, así que ninguna web que visites puede hacerlo trabajar por atrás.
 
-Se puede cambiar con variables de entorno: `BUSCAR_PUERTO`, `BUSCAR_IDIOMA` (por defecto
-`es`; de ahí salen tanto la pista de subtítulos como el idioma de whisperx) y
-`BUSCAR_MODELO`.
+Se puede cambiar con dos variables de entorno: `BUSCAR_PUERTO` y `BUSCAR_IDIOMA` (por
+defecto `es`; de ahí salen tanto la pista de subtítulos como el idioma de whisperx).
 
 ```
-app.py              servidor y lógica
-index.html          la interfaz
-start.command       el lanzador de doble clic
-test_app.py         tests del parseo y la búsqueda
-requirements.txt    lo que va en el .venv para el modo IA
+app.py                  servidor y lógica
+index.html              la interfaz
+start.command           el lanzador de doble clic
+test_app.py             tests del parseo y la búsqueda
+requirements.txt        lo que va en el .venv para el modo IA
+requirements.lock.txt   el entorno exacto, por si la instalación normal falla
 ```

@@ -66,6 +66,13 @@ uv venv --python 3.12
 uv pip install -r requirements.txt
 ```
 
+Si eso falla porque alguna dependencia de whisperx sacó una versión que rompe, instalá
+el entorno exacto que sí anda:
+
+```bash
+uv pip install -r requirements.lock.txt
+```
+
 Notas que importan:
 
 - **Fijá Python 3.12.** `whisperx` todavía no soporta 3.13 y la instalación falla si `uv`

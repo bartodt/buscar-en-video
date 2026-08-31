@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Tests de las partes puras: parseo, normalizacion y busqueda.
 
-No tocan la red ni el cache. Solo unittest de la stdlib, igual que el servidor, asi
-que corren con  python3 -m unittest test_app  sin instalar nada.
+No tocan la red, y lo que toca el cache lo hace contra una carpeta temporal. Solo
+unittest de la stdlib, igual que el servidor, asi que corren con
+python3 -m unittest test_app  sin instalar nada.
 """
 
+import json
+import os
+import shutil
+import tempfile
 import unittest
 
 import app
@@ -37,6 +42,12 @@ class ExtraerId(unittest.TestCase):
 
     def test_basura(self):
         for url in ("", None, "https://vimeo.com/12345", "hola"):
+            with self.assertRaises(app.ErrorDeUso):
+                app.extraer_id(url)
+
+    def test_lo_que_no_sea_texto_da_error_de_uso(self):
+        # Antes reventaba con AttributeError y salia un 500 "algo fallo con el video".
+        for url in (123, {"v": "x"}, ["x"], True):
             with self.assertRaises(app.ErrorDeUso):
                 app.extraer_id(url)
 
@@ -97,6 +108,42 @@ class ParsearVtt(unittest.TestCase):
         self.assertEqual([s for s, _ in cues][0], 10)
         resultados, _ = app.buscar(indice(cues), "claro", "x")
         self.assertEqual([r["timestamp"] for r in resultados], ["0:05:00"])
+
+    def test_rollup_lento_no_duplica_el_texto(self):
+        # Con un umbral fijo de segundos, una linea que tardaba mas que el en crecer
+        # no se fusionaba y el indice quedaba con "buenas buenas tardes a todos".
+        contenido = vtt(
+            "00:00:10.000 --> 00:00:20.000\nbuenas",
+            "00:00:20.000 --> 00:00:30.000\nbuenas tardes a todos",
+        )
+        self.assertEqual(app.parsear_vtt(contenido), [(10, "buenas tardes a todos")])
+
+    def test_sin_marca_de_fin_no_se_fusiona(self):
+        # Sin fin de cue no hay como saber si el rollup es contiguo: se prefiere dejar
+        # las dos entradas antes que comerse una mencion legitima de mas tarde.
+        contenido = vtt(
+            "00:00:10.000 --> mal\nbuenas",
+            "00:00:20.000 --> 00:00:30.000\nbuenas tardes",
+        )
+        self.assertEqual([s for s, _ in app.parsear_vtt(contenido)], [10, 20])
+
+    def test_autosubs_reales_de_youtube(self):
+        # El formato tal cual lo deja yt-dlp: rollup de dos renglones, cues de 10 ms,
+        # renglones que son un solo espacio y los ajustes de posicion en la flecha.
+        contenido = (
+            "WEBVTT\nKind: captions\nLanguage: es\n\n"
+            "00:00:00.030 --> 00:00:02.669 align:start position:0%\n"
+            " \nhola<00:00:00.599><c> a</c><00:00:00.960><c> todos</c>\n\n"
+            "00:00:02.669 --> 00:00:02.679 align:start position:0%\n"
+            "hola a todos\n \n\n"
+            "00:00:02.679 --> 00:00:05.310 align:start position:0%\n"
+            "hola a todos\n"
+            "bienvenidos<00:00:03.200><c> al</c><00:00:03.760><c> canal</c>\n"
+        )
+        self.assertEqual(app.parsear_vtt(contenido), [
+            (0, "hola"), (0, "a"), (0, "todos"),
+            (2, "bienvenidos"), (3, "al"), (3, "canal"),
+        ])
 
     def test_prefijo_cercano_si_se_fusiona(self):
         contenido = vtt(
@@ -167,6 +214,38 @@ class Buscar(unittest.TestCase):
         resultados, total = app.buscar(indice([(0, "hola")]), "murcielago", "x")
         self.assertEqual((resultados, total), ([], 0))
 
+    def test_consulta_que_se_solapa_consigo_misma(self):
+        # Avanzando de a un caracter, "jaja" entraba tres veces en "jajajaja" y
+        # salian tres resultados identicos, con el mismo segundo y el mismo texto.
+        resultados, total = app.buscar(indice([(10, "jajajaja")]), "jaja", "x")
+        self.assertEqual((len(resultados), total), (2, 2))
+
+    def test_el_contexto_no_corta_palabras_al_medio(self):
+        # Palabras de largo fijo 7 para que los 60 caracteres de CONTEXTO caigan a
+        # mitad de palabra en los dos extremos y el recorte tenga algo que arreglar.
+        relleno = "abcdefg " * 20
+        cues = [(5, relleno + "objetivo " + relleno)]
+        completo = indice(cues)[0]
+        resultados, _ = app.buscar(indice(cues), "objetivo", "x")
+        fragmento = resultados[0]["texto"]
+        self.assertTrue(fragmento.startswith("…") and fragmento.endswith("…"), fragmento)
+        # Antes los extremos caian a mitad de palabra: "…te larga que sirve…".
+        palabras = fragmento.strip("…").split()
+        for extremo in (palabras[0], palabras[-1]):
+            self.assertIn(extremo, completo.split(), fragmento)
+
+    def test_el_fragmento_siempre_contiene_lo_que_matcheo(self):
+        relleno = "palabra de relleno " * 8
+        cues = [(10, relleno + "son unas Pop stars y siguen " + relleno)]
+        for consulta in ("pop stars", "popstars"):
+            resultados, _ = app.buscar(indice(cues), consulta, "x")
+            self.assertIn("Pop stars", resultados[0]["texto"], consulta)
+
+    def test_consulta_que_no_es_texto(self):
+        for consulta in (123, {"q": "x"}, ["x"], None):
+            with self.assertRaises(app.ErrorDeUso):
+                app.buscar(indice([(0, "hola")]), consulta, "x")
+
 
 class Transcripcion(unittest.TestCase):
     def test_agrupa_sin_partir_palabras(self):
@@ -203,6 +282,70 @@ class Transcripcion(unittest.TestCase):
             "link": "https://youtu.be/abc?t=30",
             "aproximado": False,
         }])
+
+
+class CacheWhisper(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.mkdtemp()
+        previo, app.CACHE = app.CACHE, tmp
+        self.addCleanup(setattr, app, "CACHE", previo)
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+
+    def guardar(self, datos):
+        app._guardar_cache("vid.whisperx.json", json.dumps(datos))
+
+    def test_se_rearma_desde_la_transcripcion_cruda(self):
+        # Es la razon de guardar el crudo: cambiar como se arman los cues cuesta
+        # milisegundos en vez de horas de re-transcribir el audio.
+        self.guardar({
+            "version": app.VERSION_CACHE_WHISPER,
+            "modelo": app.MODELO_WHISPER, "idioma": app.IDIOMA, "titulo": "Un video",
+            "transcripcion": {"segments": [{
+                "start": 5.0, "text": "hola mundo",
+                "words": [{"word": "hola", "start": 5.0},
+                          {"word": "mundo", "start": 6.2}],
+            }]},
+        })
+        self.assertEqual(app._leer_cache_whisper("vid"),
+                         ([(5.0, "hola"), (6.2, "mundo")], "Un video"))
+
+    def test_otro_modelo_o_idioma_se_descarta(self):
+        for cambio in ({"modelo": "small"}, {"idioma": "en"}, {"version": 99}):
+            datos = {"version": app.VERSION_CACHE_WHISPER, "modelo": app.MODELO_WHISPER,
+                     "idioma": app.IDIOMA, "transcripcion": {"segments": [
+                         {"start": 0.0, "text": "hola", "words": []}]}}
+            datos.update(cambio)
+            self.guardar(datos)
+            self.assertIsNone(app._leer_cache_whisper("vid"), cambio)
+
+    def test_el_formato_viejo_se_rehace(self):
+        # v2 guardaba solo los cues ya armados, sin el crudo del modelo. Mantener la
+        # compat era codigo para un caso que ocurre una vez y nunca mas.
+        self.guardar({"version": 2, "modelo": app.MODELO_WHISPER, "idioma": app.IDIOMA,
+                      "titulo": "Un video", "palabras": [[5.0, "hola"], [6.2, "mundo"]]})
+        self.assertIsNone(app._leer_cache_whisper("vid"))
+
+    def test_json_roto_no_revienta(self):
+        app._guardar_cache("vid.whisperx.json", "{esto no es json")
+        self.assertIsNone(app._leer_cache_whisper("vid"))
+
+
+class CarpetaTemporal(unittest.TestCase):
+    def test_se_borra_sola_al_salir(self):
+        with app._carpeta_temporal() as tmp:
+            open(os.path.join(tmp, "audio.wav"), "w").close()
+        self.assertFalse(os.path.exists(tmp))
+        self.assertNotIn(tmp, app._TEMPORALES)
+
+    def test_la_borra_el_cierre_del_servidor(self):
+        # Los threads del servidor son daemon: al cerrar la ventana mueren sin correr
+        # su finally, y el wav de la transcripcion quedaba tirado en /var/folders.
+        with app._carpeta_temporal() as tmp:
+            open(os.path.join(tmp, "audio.wav"), "w").close()
+            self.assertIn(tmp, app._TEMPORALES)
+            app._terminar_hijos()
+            self.assertFalse(os.path.exists(tmp))
+        self.assertNotIn(tmp, app._TEMPORALES)
 
 
 class Formatear(unittest.TestCase):
