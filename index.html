@@ -35,6 +35,7 @@
   main { max-width: 44rem; margin: 0 auto; }
   h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
   .sub { color: var(--tenue); margin: 0 0 2rem; font-size: .95rem; }
+  .pie { margin-top: 3rem; }
   form { display: grid; gap: .75rem; }
   .fila { display: flex; gap: .75rem; }
   .fila input { flex: 1; }
@@ -146,6 +147,12 @@
   <p id="estado" aria-live="polite"></p>
   <p id="titulo" hidden></p>
   <ol id="resultados"></ol>
+
+  <!-- La app no tiene ventana propia ni icono en el Dock: este botón es la única
+       forma visible de apagar el motor cuando se termina de usar. -->
+  <p class="pie">
+    <button id="apagar" type="button" class="secundario">Cerrar el buscador</button>
+  </p>
 </main>
 
 <script>
@@ -165,16 +172,36 @@
   const vistos = new Set();
   const idsPorUrl = new Map();
 
+  // Mientras la IA trabaja, el servidor publica en /api/progreso en qué anda y en qué
+  // porcentaje, y acá se lo pregunta una vez por segundo. Sin esto la única señal de
+  // avance era el "Progress: 12%" de whisperx en la ventana negra de Terminal, que
+  // empaquetado como app no existe: la espera de 40 minutos quedaba completamente ciega.
   function cronometro(mensaje) {
     const arranque = Date.now();
+    let progreso = null;
     const pintar = () => {
       const seg = Math.floor((Date.now() - arranque) / 1000);
       const mm = Math.floor(seg / 60);
       const ss = String(seg % 60).padStart(2, "0");
-      estado.textContent = `${mensaje} (${mm}:${ss})`;
+      let que = mensaje;
+      if (progreso && progreso.etapa) {
+        que = progreso.etapa.charAt(0).toUpperCase() + progreso.etapa.slice(1);
+        que += progreso.pct == null ? "…" : ` ${Math.round(progreso.pct)}%`;
+      }
+      estado.textContent = `${que} (${mm}:${ss})`;
+    };
+    const consultar = async () => {
+      try {
+        const respuesta = await fetch("/api/progreso");
+        progreso = respuesta.ok ? await respuesta.json() : null;
+      } catch {
+        // Si el buscador se cayó lo reporta el fetch grande, con su mensaje. Acá se
+        // ignora a propósito: un cronómetro no tiene que pisar el error de verdad.
+      }
+      pintar();
     };
     pintar();
-    return setInterval(pintar, 1000);
+    return setInterval(consultar, 1000);
   }
 
   function pintar(items) {
@@ -245,8 +272,8 @@
         // Un 500 con traceback, o el servidor caido a mitad: sin esto el usuario
         // veia "Unexpected token '<' in JSON at position 0".
         throw new Error(
-          "El servidor respondió algo que no entiendo. " +
-          "Fijate si hay un error en la ventana de Terminal."
+          "El buscador respondió algo que no entiendo. " +
+          "Cerralo y volvé a abrirlo."
         );
       }
       if (!respuesta.ok) throw new Error(datos.error || "Algo falló.");
@@ -294,7 +321,7 @@
       estado.className = "error";
       // Un TypeError acá es siempre el fetch que no llegó a ningún lado.
       estado.textContent = error instanceof TypeError
-        ? "Se cortó la conexión con el buscador. ¿Seguís teniendo abierta la ventana de Terminal?"
+        ? "Se cortó la conexión con el buscador. ¿Se cerró? Abrilo de nuevo y probá otra vez."
         : error.message;
     } finally {
       clearInterval(tic);
@@ -302,6 +329,23 @@
       botonTodo.disabled = false;
     }
   }
+
+  document.getElementById("apagar").addEventListener("click", async () => {
+    estado.className = "";
+    estado.textContent = "Cerrando…";
+    try {
+      await fetch("/api/apagar", { method: "POST" });
+    } catch {
+      // Se murió antes de contestar, que es exactamente lo que le pedimos.
+    }
+    document.querySelector("main").replaceChildren(
+      Object.assign(document.createElement("h1"), { textContent: "Listo, ya está cerrado." }),
+      Object.assign(document.createElement("p"), {
+        className: "sub",
+        textContent: "Podés cerrar esta pestaña. Para volver a usarlo, doble clic en el ícono de siempre.",
+      }),
+    );
+  });
 
   form.addEventListener("submit", (evento) => {
     evento.preventDefault();

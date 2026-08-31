@@ -95,7 +95,8 @@ def _matar(proceso):
         proceso.kill()
 
 
-def _correr(comando, timeout, mensaje_timeout, mostrar_salida=False):
+def _correr(comando, timeout, mensaje_timeout, mostrar_salida=False,
+            entorno=None, al_progreso=None):
     """subprocess.run, pero con el hijo anotado para poder matarlo al salir.
 
     Los threads del servidor son daemon: al cerrar la ventana mueren sin correr sus
@@ -104,13 +105,22 @@ def _correr(comando, timeout, mensaje_timeout, mostrar_salida=False):
     tirado en /var/folders, sin ninguna ventana que lo delatara.
     Con mostrar_salida el stdout del hijo va a la terminal en vez de juntarse en
     memoria: es como se ve el progreso de una transcripcion larga.
+    Con al_progreso el stdout se lee linea por linea y cada una se le pasa a esa
+    funcion ademas de escribirse en la terminal. Es lo que alimenta /api/progreso:
+    empaquetada como .app no hay ninguna terminal donde mirar, asi que el porcentaje
+    tiene que llegar al navegador o la espera de una transcripcion es a ciegas.
     """
+    if al_progreso is not None:
+        return _correr_con_progreso(
+            comando, timeout, mensaje_timeout, entorno, al_progreso
+        )
     proceso = subprocess.Popen(
         comando,
         stdout=None if mostrar_salida else subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
+        env=entorno,
     )
     with _LOCK_HIJOS:
         _HIJOS.add(proceso)
@@ -124,6 +134,67 @@ def _correr(comando, timeout, mensaje_timeout, mostrar_salida=False):
         with _LOCK_HIJOS:
             _HIJOS.discard(proceso)
     return proceso.returncode, salida or "", error or ""
+
+
+def _correr_con_progreso(comando, timeout, mensaje_timeout, entorno, al_progreso):
+    """Igual que _correr, pero drenando stdout con un thread propio.
+
+    No se puede usar communicate() para esto: seria el segundo lector del mismo pipe
+    y las dos mitades se roban las lineas. Con dos threads (uno por pipe) y un wait()
+    aparte, el progreso sale en tiempo real y el stderr sigue completo para el
+    diagnostico de errores.
+    """
+    # Sin esto Python bufferea por bloques cuando la salida es un pipe y los porcentajes
+    # llegan todos juntos al final, cuando ya no le sirven a nadie. Vale para los dos
+    # hijos que pasan por aca: yt-dlp y whisperx son los dos programas en Python.
+    entorno = dict(entorno or os.environ, PYTHONUNBUFFERED="1")
+    proceso = subprocess.Popen(
+        comando,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        start_new_session=True,
+        env=entorno,
+    )
+    with _LOCK_HIJOS:
+        _HIJOS.add(proceso)
+    errores = []
+
+    def _drenar_stdout():
+        for linea in proceso.stdout:
+            # El progreso viaja en lineas que terminan en \r, no en \n: whisperx
+            # repinta el porcentaje sobre si mismo. Sin este split la barra entera
+            # llega como una sola linea gigante al final y no sirve para nada.
+            for pedazo in linea.replace("\r", "\n").splitlines():
+                if pedazo.strip():
+                    print(pedazo)
+                    try:
+                        al_progreso(pedazo)
+                    except Exception:  # el progreso es cosmetico: no puede tumbar el job
+                        pass
+
+    def _drenar_stderr():
+        errores.append(proceso.stderr.read() or "")
+
+    hilos = [
+        threading.Thread(target=_drenar_stdout, daemon=True),
+        threading.Thread(target=_drenar_stderr, daemon=True),
+    ]
+    for hilo in hilos:
+        hilo.start()
+    try:
+        proceso.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _matar(proceso)
+        proceso.wait()
+        raise ErrorDeUso(mensaje_timeout) from None
+    finally:
+        with _LOCK_HIJOS:
+            _HIJOS.discard(proceso)
+        for hilo in hilos:
+            hilo.join(timeout=5)
+    return proceso.returncode, "", "".join(errores)
 
 
 def _terminar_hijos(*senal):
@@ -147,6 +218,86 @@ def _exigir(binario, arreglo):
         raise ErrorDeUso(
             "Falta instalar %s. Abrí la Terminal y corré:  %s" % (binario, arreglo)
         )
+
+
+# --- progreso --------------------------------------------------------------
+
+# Uno solo, el del trabajo mas reciente, no un diccionario por video: el caso real es
+# una persona con una pestaña buscando una cosa a la vez, y el navegador pregunta por
+# "lo que esta pasando" sin saber ningun id. Dos busquedas simultaneas se pisan el
+# porcentaje entre si, y eso es todo lo que pasa.
+#
+# Lo que si importa es _TRABAJOS: sin el contador, la primera de dos busquedas en
+# terminar le borraba el progreso a la otra, que seguia corriendo. Se veia como el
+# porcentaje desapareciendo en la mitad de una transcripcion de dos minutos.
+_PROGRESO = {"etapa": None, "pct": None}
+_TRABAJOS = 0
+_LOCK_PROGRESO = threading.Lock()
+
+_PCT_WHISPERX = re.compile(r"Progress:\s*([\d.]+)\s*%")
+_PCT_YTDLP = re.compile(r"\[download\]\s+([\d.]+)\s*%")
+
+
+def _fijar_progreso(etapa, pct=None):
+    with _LOCK_PROGRESO:
+        _PROGRESO["etapa"] = etapa
+        _PROGRESO["pct"] = pct
+
+
+def _abrir_trabajo():
+    global _TRABAJOS
+    with _LOCK_PROGRESO:
+        _TRABAJOS += 1
+
+
+def _cerrar_trabajo():
+    """Limpia el progreso solo cuando no queda ningun trabajo en curso."""
+    global _TRABAJOS
+    with _LOCK_PROGRESO:
+        _TRABAJOS = max(0, _TRABAJOS - 1)
+        if _TRABAJOS == 0:
+            _PROGRESO["etapa"] = None
+            _PROGRESO["pct"] = None
+
+
+def _ver_progreso():
+    with _LOCK_PROGRESO:
+        return {"etapa": _PROGRESO["etapa"], "pct": _PROGRESO["pct"]}
+
+
+def _modelo_ya_bajado():
+    """Si el modelo esta en el cache de Hugging Face, la espera es de calculo y no de red.
+
+    Cambia el cartel que ve la persona: la primera corrida se lleva ~1,9 GB de descarga y
+    ahi conviene decirlo, porque son varios minutos en los que whisperx no imprime nada y
+    parece colgado. De la segunda en adelante seria mentira.
+    """
+    hub = os.path.expanduser("~/.cache/huggingface/hub")
+    try:
+        return any("faster-whisper" in nombre for nombre in os.listdir(hub))
+    except OSError:
+        return False
+
+
+def _observar(etapa, patron, etapa_2=None):
+    """Devuelve el callback de _correr que va traduciendo la salida a un porcentaje.
+
+    whisperx cuenta de 0 a 100 dos veces —primero transcribe, despues alinea palabra por
+    palabra contra el audio— y sin etapa_2 la barra llegaba al 100% y volvia al 20% sin
+    ninguna explicacion. El salto para atras es la senal de que empezo la segunda pasada.
+    """
+    estado = {"etapa": etapa, "ultimo": -1.0}
+
+    def _mirar(linea):
+        encontrado = patron.search(linea)
+        if not encontrado:
+            return
+        pct = float(encontrado.group(1))
+        if etapa_2 and pct < estado["ultimo"]:
+            estado["etapa"] = etapa_2
+        estado["ultimo"] = pct
+        _fijar_progreso(estado["etapa"], pct)
+    return _mirar
 
 
 # --- cache -----------------------------------------------------------------
@@ -403,12 +554,29 @@ def _hilos():
         return os.cpu_count() or 4
 
 
-def _binario_whisperx():
-    """whisperx vive en el .venv del proyecto; el servidor corre con el python del sistema."""
-    local = os.path.join(RAIZ, ".venv", "bin", "whisperx")
-    if os.path.exists(local):
-        return local
-    return shutil.which("whisperx")
+def _comando_whisperx():
+    """Devuelve (comando, entorno) para invocar whisperx, o (None, None) si no esta.
+
+    Nunca el script `bin/whisperx`, siempre `python -m whisperx`. El script lleva la
+    ruta absoluta del interprete escrita en el shebang: sigue existiendo despues de
+    mover la carpeta, asi que se encuentra igual, pero explota con "bad interpreter".
+    Invocando al interprete a mano el modulo se resuelve por PYTHONPATH y la carpeta
+    se puede mover a cualquier lado. Es lo que hace posible la .app.
+
+    Tres ubicaciones, en orden: adentro del bundle, en el .venv del proyecto (la
+    instalacion de desarrollo), o un whisperx suelto en el PATH.
+    """
+    py_bundle = os.path.join(RAIZ, "python", "bin", "python3")
+    libs = os.path.join(RAIZ, "pylibs")
+    if os.path.exists(py_bundle) and os.path.isdir(os.path.join(libs, "whisperx")):
+        return [py_bundle, "-m", "whisperx"], dict(os.environ, PYTHONPATH=libs)
+    py_venv = os.path.join(RAIZ, ".venv", "bin", "python3")
+    if os.path.exists(py_venv):
+        return [py_venv, "-m", "whisperx"], None
+    suelto = shutil.which("whisperx")
+    if suelto:
+        return [suelto], None
+    return None, None
 
 
 def _leer_cache_whisper(video_id):
@@ -484,12 +652,11 @@ def transcribir_whisper(video_id):
     if cacheado:
         return cacheado
 
-    binario = _binario_whisperx()
-    if not binario:
+    comando_base, entorno = _comando_whisperx()
+    if not comando_base:
         raise ErrorDeUso(
-            "No encontré whisperx. Debería estar en la carpeta .venv del proyecto. "
-            "Abrí la Terminal en esta carpeta y corré:  "
-            "uv venv --python 3.12 && uv pip install -r requirements.txt"
+            "El modo preciso con IA no está disponible en esta copia de la app. "
+            "Probá con el modo normal, que no lo necesita."
         )
     # Se chequean antes de bajar nada: si faltan, subprocess tira FileNotFoundError y
     # el usuario terminaba viendo un "algo falló" generico en vez del comando a correr.
@@ -500,10 +667,10 @@ def transcribir_whisper(video_id):
         cacheado = _leer_cache_whisper(video_id)
         if cacheado:
             return cacheado
-        return _transcribir_whisper(video_id, binario)
+        return _transcribir_whisper(video_id, comando_base, entorno)
 
 
-def _transcribir_whisper(video_id, binario):
+def _transcribir_whisper(video_id, comando_base, entorno):
     with _carpeta_temporal() as tmp:
         audio = os.path.join(tmp, "audio.wav")
         comando_audio = [
@@ -520,8 +687,10 @@ def _transcribir_whisper(video_id, binario):
             "-o", os.path.join(tmp, "audio.%(ext)s"),
             URL_VIDEO % video_id,
         ]
+        _fijar_progreso("bajando el audio")
         _codigo, salida, error = _correr(
-            comando_audio, 600, "YouTube tardó demasiado en responder. Probá de nuevo."
+            comando_audio, 600, "YouTube tardó demasiado en responder. Probá de nuevo.",
+            al_progreso=_observar("bajando el audio", _PCT_YTDLP),
         )
         # Lo que decide no es el returncode sino que el wav haya quedado: yt-dlp puede
         # salir con 0 y no haber escrito nada si el postprocesador falló.
@@ -531,7 +700,7 @@ def _transcribir_whisper(video_id, binario):
         titulo = _titulo_de_info(tmp, "audio", video_id)
 
         comando_whisper = [
-            binario, audio,
+            *comando_base, audio,
             "--model", MODELO_WHISPER,
             "--language", IDIOMA,
             # ctranslate2 en CPU no tiene float16; int8 es lo que lo hace usable.
@@ -547,10 +716,17 @@ def _transcribir_whisper(video_id, binario):
             "--print_progress", "True",
         ]
         print("Transcribiendo %s con whisperx (%s)…" % (video_id, MODELO_WHISPER))
+        # Declarada de antemano porque whisperx no imprime nada durante la carga del
+        # modelo, y sus "Progress:" ademas llegan de golpe al final: el cartel de la
+        # etapa es lo unico que la persona va a tener durante casi toda la espera.
+        _fijar_progreso("transcribiendo con IA" if _modelo_ya_bajado()
+                        else "bajando el modelo de IA (~1,9 GB, una sola vez)")
         codigo, _salida, error = _correr(
             comando_whisper, 5400,
             "La transcripción tardó demasiado. Probá con un video más corto.",
-            mostrar_salida=True,
+            entorno=entorno,
+            al_progreso=_observar("transcribiendo", _PCT_WHISPERX,
+                                  "alineando las palabras"),
         )
 
         json_path = os.path.join(tmp, "audio.json")
@@ -977,6 +1153,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/salud":
             return self._responder(200, {"ok": True})
+        if self.path == "/api/progreso":
+            return self._responder(200, _ver_progreso())
         if self.path in ("/", "/index.html"):
             try:
                 with open(os.path.join(RAIZ, "index.html"), "rb") as fh:
@@ -991,6 +1169,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
+        if self.path == "/api/apagar":
+            return self._apagar()
         if self.path == "/api/buscar":
             return self._api(self._buscar)
         if self.path == "/api/transcripcion":
@@ -1005,6 +1185,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         if not self._mismo_origen():
             return self._responder(403, {"error": "Pedido de otro origen."})
+        _abrir_trabajo()
         try:
             datos = self._leer_json()
             video_id = extraer_id(datos.get("url"))
@@ -1021,9 +1202,28 @@ class Handler(BaseHTTPRequestHandler):
             # mudo: la interfaz manda a mirar la Terminal y no habia nada que mirar.
             traceback.print_exc()
             return self._responder(500, {"error": "Algo falló al procesar el video."})
+        finally:
+            # Que el porcentaje no quede clavado en la pantalla despues de terminar:
+            # el navegador sigue preguntando hasta que le llega la respuesta, y sin
+            # esto lo ultimo que ve es "transcribiendo 99%" para siempre.
+            _cerrar_trabajo()
         # Fuera del try a proposito: si el write falla porque cerraron la pestaña, no
         # tiene sentido intentar un 500 sobre el mismo socket ya empezado.
         self._responder(200, payload)
+
+    def _apagar(self):
+        """Cerrar el buscador desde la pagina.
+
+        Empaquetado como .app no hay ninguna ventana que cerrar: el servidor queda
+        corriendo invisible y el puerto tomado, y el proximo doble clic no arranca
+        nada. El boton de la interfaz es la unica forma de apagarlo que la persona ve.
+        """
+        if not self._mismo_origen():
+            return self._responder(403, {"error": "Pedido de otro origen."})
+        self._responder(200, {"ok": True})
+        # En un thread aparte: shutdown() espera a que serve_forever corte, y llamarlo
+        # desde el handler que ese mismo loop esta atendiendo es un abrazo mortal.
+        threading.Thread(target=_apagar_servidor, daemon=True).start()
 
     def _leer_json(self):
         try:
@@ -1049,6 +1249,15 @@ class Handler(BaseHTTPRequestHandler):
         return {"resultados": bloques, "total": len(bloques)}
 
 
+_SERVIDOR = None
+
+
+def _apagar_servidor():
+    _terminar_hijos()
+    if _SERVIDOR is not None:
+        _SERVIDOR.shutdown()
+
+
 def main():
     # Sin esto, Python bufferea por bloques cuando la salida no es una terminal y los
     # avisos aparecen despues del progreso de whisperx, o directamente al final.
@@ -1058,8 +1267,9 @@ def main():
     for senal in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
         if senal is not None:
             signal.signal(senal, _terminar_hijos)
+    global _SERVIDOR
     try:
-        servidor = ThreadingHTTPServer(("127.0.0.1", PUERTO), Handler)
+        servidor = _SERVIDOR = ThreadingHTTPServer(("127.0.0.1", PUERTO), Handler)
     except OSError as err:
         print("No pude abrir el puerto %d (%s)." % (PUERTO, err), file=sys.stderr)
         print("¿Ya tenés otra ventana del buscador abierta?", file=sys.stderr)
