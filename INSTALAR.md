@@ -76,6 +76,28 @@ pwd && ls app.py index.html start.command requirements.txt
 
 Si eso falla, no sigas: o estás en el lugar equivocado, o el ZIP se descomprimió a medias.
 
+### Y movela ahora, antes de instalar nada
+
+No trabajes sobre `~/Downloads/buscar-en-video-main`. Ese nombre no lo eligió la persona, la
+carpeta de Descargas se vacía o se desordena, y en un rato va a tener el `.venv` adentro:
+~1 GB que alguien va a borrar por error.
+
+Movela **ahora**, antes del Paso 3, y no después. Los venv guardan rutas absolutas: el
+shebang de `.venv/bin/whisperx` apunta a la carpeta donde se creó. Si movés después, el
+binario **sigue existiendo** —así que `app.py` lo encuentra igual— pero explota con
+`bad interpreter`, y como el Paso 5 no prueba el modo IA, la instalación te va a dar toda
+verde con la IA rota. Mover ahora cuesta un segundo; mover después cuesta borrar el `.venv`
+y volver a bajar 1 GB.
+
+```bash
+mkdir -p ~/Aplicaciones
+mv "$(pwd)" ~/Aplicaciones/buscar-en-video
+cd ~/Aplicaciones/buscar-en-video
+pwd && ls app.py index.html start.command requirements.txt
+```
+
+De acá en adelante, todo lo que sigue es sobre esta ruta nueva.
+
 ## Paso 1 — Homebrew
 
 Primero fijate si ya está:
@@ -298,29 +320,29 @@ modelos (`large-v3-turbo` de transcripción, ~1,5 GB, y el de alineación en esp
 y transcribir un video lleva varios minutos. Dejá esa descarga para la primera vez que la
 persona tilde la opción en la interfaz, y avisale de antemano que esa primera vez tarda.
 
-Cuando termines, cerrá el servidor de prueba (`pkill -f "python3 app.py"`) — el uso normal
-es por doble clic.
+Cuando termines, cerrá el servidor de prueba. Ojo con esto: `pkill -f "python3 app.py"` **no
+sirve**, porque el proceso queda en la tabla con la ruta real del binario de Python
+(`.../Python.app/Contents/MacOS/Python app.py`) y el patrón no matchea nunca. Sale sin decir
+nada y el servidor te queda vivo. Cerralo por el puerto, que además se lleva puesto a
+cualquier otra copia:
+
+```bash
+lsof -ti tcp:8765 | xargs kill
+```
+
+El uso normal es por doble clic.
 
 ## Paso 6 — Dejarle la app a mano
 
-No la dejes en `~/Downloads/buscar-en-video-main`. Ese nombre no lo eligió la persona, la
-carpeta de Descargas se vacía o se desordena, y con el `.venv` adentro son ~1 GB que
-alguien va a borrar por error.
-
-Movela a un lugar estable y dejale un acceso en el Escritorio:
+La carpeta ya quedó en su lugar definitivo desde el Paso 0, así que acá no hay que mover
+nada. Falta sólo el acceso en el Escritorio, que es por donde la persona la va a abrir:
 
 ```bash
-mkdir -p ~/Aplicaciones
-mv "$(pwd)" ~/Aplicaciones/buscar-en-video
-cd ~/Aplicaciones/buscar-en-video
 ln -sf ~/Aplicaciones/buscar-en-video/start.command ~/Desktop/"Buscar en video.command"
 ```
 
-Movela **antes** de instalar el `.venv`, o si ya lo instalaste, verificá después de mover
-que `.venv/bin/whisperx --help` siga andando: los venv guardan rutas absolutas. Si se
-rompió, `rm -rf .venv` y repetí el Paso 3 desde la ubicación nueva.
-
-Después de mover, volvé a correr el Paso 4 (`chmod`/`xattr`) y el 5.3 sobre la ruta nueva.
+Es un enlace, no una copia, y el doble clic funciona igual: Finder lo resuelve antes de
+ejecutarlo, así que `start.command` se para en la carpeta buena y no en el Escritorio.
 
 Para cerrar, decile a la persona dónde quedó y cómo se abre:
 
@@ -345,7 +367,7 @@ es lo único que la persona necesita leer.
 |---|---|
 | `start.command` se abre como texto | Falta el permiso: `chmod +x start.command` |
 | macOS dice que no puede verificar el archivo | Cuarentena: clic derecho → Abrir → Abrir |
-| `Address already in use` al arrancar | El puerto 8765 ya está ocupado, probablemente por otra copia del servidor corriendo. Cerrala: `pkill -f "python3 app.py"` |
+| `Address already in use` al arrancar | El puerto 8765 ya está ocupado, probablemente por otra copia del servidor corriendo. Cerrala por el puerto: `lsof -ti tcp:8765 \| xargs kill`. (`pkill -f "python3 app.py"` **no matchea**: el proceso queda con la ruta real del binario de Python.) |
 | El `.venv` dejó de andar después de mover la carpeta | Los venv guardan rutas absolutas: `rm -rf .venv` y repetí el Paso 3 desde la ubicación nueva |
 | La app dice "No encontré whisperx" | El Paso 3 no terminó bien. Verificá que exista `.venv/bin/whisperx` y que el `.venv` esté **dentro de esta carpeta** |
 | `whisperx` instala pero explota al correr | Casi siempre es la versión de Python. Confirmá `.venv/bin/python -V` → tiene que decir 3.12.x. Si dice 3.13, borrá el `.venv` y repetí el Paso 3 con `--python 3.12` |

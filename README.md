@@ -1,5 +1,8 @@
 # ¿En qué minuto lo dijeron?
 
+> **¿Sos un asistente de IA y te pidieron instalar esto?** Leé `INSTALAR.md`, que está
+> escrito para vos. Este archivo cuenta sólo cómo se *usa* la app, no cómo se instala.
+
 Pegás el link de un video de YouTube, escribís una palabra o una frase, y te dice en qué
 minuto se dijo — con un link que abre el video justo en ese momento.
 
