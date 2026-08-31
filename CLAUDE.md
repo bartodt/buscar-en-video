@@ -6,6 +6,7 @@ escrito para vos, no para la persona.
 
 **No sigas el `README.md`.** Está escrito para quien va a *usar* la app, no para instalarla:
 describe la interfaz y los dos modos de búsqueda, y no alcanza como guía de instalación.
+(`ARQUITECTURA.md` son notas de diseño, tampoco es la guía.)
 
 La persona que te pasó esta carpeta puede no saber nada de computadoras. Hacé vos la
 instalación entera: no le pidas que abra la Terminal ni que copie comandos. `INSTALAR.md`

@@ -40,7 +40,41 @@ en `app.py`, que busca `./.venv/bin/whisperx` y si no está cae a `shutil.which`
 - Verificá la arquitectura (`uname -m`): `arm64` es Apple Silicon, `x86_64` es Intel. Los
   dos andan; todo corre en CPU, no se usa GPU.
 - Espacio en disco necesario: **~3,5 GB** (≈1 GB el `.venv`, ≈1,9 GB los modelos que se
-  bajan la primera vez que se usa el modo IA).
+  bajan la primera vez que se usa el modo IA). Comprobalo antes de bajar nada, así no te
+  quedás sin espacio a mitad de una descarga de 1 GB:
+
+  ```bash
+  df -h .
+  ```
+
+## Paso 0 — Pararte en la carpeta correcta
+
+Todo lo que sigue asume que estás **parado en la carpeta que contiene `app.py`**, y varios
+pasos se rompen en silencio si no lo estás: `uv venv` te crea el `.venv` un nivel más
+arriba y después `app.py` no lo encuentra, porque lo busca en `RAIZ/.venv/bin/whisperx`
+(ver `_binario_whisperx()`).
+
+Ojo con esto: la persona bajó un ZIP de GitHub y lo descomprimió, así que la carpeta se
+llama algo como **`buscar-en-video-main`** (con el sufijo de la rama) y está adentro de
+Descargas. Si te señaló "la carpeta", puede tranquilamente haberte señalado `Descargas` o
+la carpeta que envuelve a la buena. No lo adivines, buscá `app.py`:
+
+```bash
+for d in ~/Downloads ~/Desktop ~/Descargas ~/Escritorio ~/Documents; do
+  [ -d "$d" ] && find "$d" -maxdepth 3 -name app.py 2>/dev/null
+done
+```
+
+(El `for` con el `[ -d ]` no es adorno: `find` sobre una carpeta que no existe sale con
+error, y en un macOS en inglés `~/Descargas` y `~/Escritorio` no existen.)
+
+Y hacé `cd` al directorio que lo contiene antes de seguir. Confirmá que estás bien:
+
+```bash
+pwd && ls app.py index.html start.command requirements.txt
+```
+
+Si eso falla, no sigas: o estás en el lugar equivocado, o el ZIP se descomprimió a medias.
 
 ## Paso 1 — Homebrew
 
@@ -110,9 +144,21 @@ brew install yt-dlp ffmpeg uv
   pero instalalo igual.
 - `uv` — arma el entorno de Python. Alternativa: `curl -LsSf https://astral.sh/uv/install.sh | sh`.
 
-Comprobá que `python3` exista (`command -v python3`). Si no está, macOS lo ofrece al
-correr `xcode-select --install`, o se baja de [python.org](https://www.python.org/downloads/).
-Sirve cualquier 3.8+; es solo para el servidor.
+Comprobá que `python3` exista (`command -v python3`). Sirve cualquier 3.8+; es solo para
+el servidor. Si no está, **instalalo con Homebrew**, que ya tenés del Paso 1 y no necesita
+que la persona haga nada:
+
+```bash
+brew install python
+```
+
+Evitá `xcode-select --install`: abre un diálogo gráfico que tenés que pedirle a la persona
+que acepte, y encima tarda. Si igual terminás yendo por ahí, avisale que va a aparecer una
+ventana pidiendo instalar "herramientas de línea de comandos" y que tiene que apretar
+**Instalar**.
+
+`start.command` manda a python.org si no encuentra `python3`, pero eso es el mensaje de
+último recurso para cuando la persona está sola: vos usá `brew install python`.
 
 ## Paso 3 — El entorno de whisperx
 
@@ -124,9 +170,13 @@ uv pip install -r requirements.txt
 ```
 
 Si eso falla porque alguna dependencia de whisperx sacó una versión que rompe, instalá
-el entorno exacto que sí anda:
+el entorno exacto que sí anda. **Borrá el `.venv` primero**: el intento fallido dejó
+paquetes a medio instalar adentro, y el lock sobre esa base puede quedar en un estado que
+resuelve bien pero explota al correr.
 
 ```bash
+rm -rf .venv
+uv venv --python 3.12
 uv pip install -r requirements.lock.txt
 ```
 
@@ -168,30 +218,47 @@ Si aun así aparece el bloqueo, la persona tiene que hacer
 
 ## Paso 5 — Verificación
 
-Corré estas comprobaciones y reportá cada una:
+La regla de este paso: **no declares "quedó andando" hasta que la prueba real del modo
+subtítulos haya devuelto resultados.** Todo lo de abajo puede dar verde con la app
+igualmente inservible para la persona.
+
+### 5.1 — Dependencias
 
 ```bash
 command -v yt-dlp ffmpeg && ./.venv/bin/whisperx --help >/dev/null && echo "dependencias ok"
 ```
 
-Arrancá el servidor y probá que responda:
+### 5.2 — Tests del parseo y la búsqueda
 
-```bash
-python3 app.py &
-sleep 2
-curl -fs http://127.0.0.1:8765/api/salud
-```
-
-Tiene que devolver `{"ok": true}`.
-
-Los tests del parseo y la búsqueda no necesitan red ni nada instalado:
+No necesitan red ni nada instalado:
 
 ```bash
 python3 -m unittest test_app
 ```
 
-Prueba real del modo subtítulos (rápida, ~10 segundos) — usá un video de YouTube
-cualquiera que tenga subtítulos:
+`ProcesosHijos.test_al_salir_se_lleva_al_nieto` es **inestable**: mide tiempos reales y
+falla por timeout si la máquina está cargada (bajando torch, por ejemplo). Si es el único
+que falla, corré los tests de nuevo antes de tocar nada; si pasa en la segunda o tercera
+corrida, está bien. **No te pongas a arreglar `app.py`**: no es un problema de instalación.
+
+### 5.3 — El lanzador de verdad
+
+Probá **`start.command`**, no `python3 app.py`. Es lo único que ejercita lo que la persona
+va a usar realmente: el permiso de ejecución, la cuarentena, el arranque y el `open` del
+navegador. Si solo probás `python3 app.py`, el Paso 4 queda sin verificar.
+
+```bash
+./start.command &
+sleep 4
+curl -fs http://127.0.0.1:8765/api/salud
+```
+
+Tiene que devolver `{"ok": true}` y además abrirse una pestaña del navegador. Si el
+`curl` anda pero la pestaña no aparece, revisá el Paso 4: casi siempre es cuarentena.
+
+### 5.4 — Prueba real del modo subtítulos (la que decide)
+
+Con el servidor levantado del punto anterior:
 
 ```bash
 curl -s -X POST http://127.0.0.1:8765/api/buscar \
@@ -199,14 +266,69 @@ curl -s -X POST http://127.0.0.1:8765/api/buscar \
   -d '{"url":"https://www.youtube.com/watch?v=VIDEO_ID","consulta":"una palabra que se diga"}'
 ```
 
-Tiene que venir un JSON con `"fuente": "subtitulos"` y una lista de `resultados`.
+Usá un video con subtítulos automáticos **en español** (es el idioma que pide la app). Un
+video en otro idioma va a fallar por "no tiene subtítulos en español", y eso no es un
+problema de instalación.
+
+Tiene que venir un JSON con `"fuente": "subtitulos"` y una lista de `resultados` no vacía.
+
+**Si en vez de eso viene `"YouTube te limitó por hacer muchos pedidos seguidos"`**, no lo
+despaches como "esperá un minuto". Es un 429 de YouTube sobre el endpoint de subtítulos y
+es frecuente; el punto es que **desde acá no podés distinguir una instalación sana de una
+rota**. Hacé esto:
+
+1. Esperá 60 segundos y reintentá. Hasta tres veces, con otro video la última.
+2. Si sigue dando 429, comprobá que el problema sea de YouTube y no tuyo:
+
+   ```bash
+   yt-dlp --skip-download --write-auto-subs --sub-langs 'es.*' --sub-format vtt \
+     -o '/tmp/prueba.%(ext)s' 'https://www.youtube.com/watch?v=VIDEO_ID'
+   ```
+
+   Si `yt-dlp` a mano también da 429, la instalación está bien y el bloqueo es de red.
+3. En ese caso **no le digas a la persona que quedó andando**. Decile la verdad:
+
+   > "Quedó todo instalado, pero no lo pude probar de punta a punta: YouTube está
+   > bloqueando pedidos desde esta conexión en este momento. Probalo vos en un rato con
+   > doble clic; si te sigue diciendo que esperes, andá probando cada tanto. No hay que
+   > reinstalar nada."
 
 **No pruebes el modo IA como parte de la instalación.** La primera corrida baja ~1,9 GB de
 modelos (`large-v3-turbo` de transcripción, ~1,5 GB, y el de alineación en español, ~360 MB)
 y transcribir un video lleva varios minutos. Dejá esa descarga para la primera vez que la
 persona tilde la opción en la interfaz, y avisale de antemano que esa primera vez tarda.
 
-Cuando termines, matá el servidor de prueba (`kill %1`) — el uso normal es por doble clic.
+Cuando termines, cerrá el servidor de prueba (`pkill -f "python3 app.py"`) — el uso normal
+es por doble clic.
+
+## Paso 6 — Dejarle la app a mano
+
+No la dejes en `~/Downloads/buscar-en-video-main`. Ese nombre no lo eligió la persona, la
+carpeta de Descargas se vacía o se desordena, y con el `.venv` adentro son ~1 GB que
+alguien va a borrar por error.
+
+Movela a un lugar estable y dejale un acceso en el Escritorio:
+
+```bash
+mkdir -p ~/Aplicaciones
+mv "$(pwd)" ~/Aplicaciones/buscar-en-video
+cd ~/Aplicaciones/buscar-en-video
+ln -sf ~/Aplicaciones/buscar-en-video/start.command ~/Desktop/"Buscar en video.command"
+```
+
+Movela **antes** de instalar el `.venv`, o si ya lo instalaste, verificá después de mover
+que `.venv/bin/whisperx --help` siga andando: los venv guardan rutas absolutas. Si se
+rompió, `rm -rf .venv` y repetí el Paso 3 desde la ubicación nueva.
+
+Después de mover, volvé a correr el Paso 4 (`chmod`/`xattr`) y el 5.3 sobre la ruta nueva.
+
+Para cerrar, decile a la persona dónde quedó y cómo se abre:
+
+> "Listo, ya está andando. Te dejé en el Escritorio un archivo que se llama **Buscar en
+> video**: doble clic ahí y se abre. Se va a abrir una ventana negra con letras: no la
+> cierres mientras lo usás, es el motor. El buscador se abre solo en tu navegador. Cuando
+> terminás, cerrás la ventana negra y listo. Si alguna vez se te cierra sin querer, no
+> pasa nada: doble clic de nuevo."
 
 ## Cómo se usa después
 
@@ -214,7 +336,8 @@ Doble clic en **`start.command`**. Se abre una ventana negra de Terminal (es el 
 tiene que quedar abierta) y el buscador aparece solo en el navegador, en
 `http://127.0.0.1:8765`. Para cerrarlo, se cierra la ventana negra.
 
-El detalle de la interfaz y de los dos modos está en el `README.md` de esta carpeta.
+El detalle de la interfaz y de los dos modos está en el `README.md` de esta carpeta, que
+es lo único que la persona necesita leer.
 
 ## Si algo falla
 
@@ -223,10 +346,13 @@ El detalle de la interfaz y de los dos modos está en el `README.md` de esta car
 | `start.command` se abre como texto | Falta el permiso: `chmod +x start.command` |
 | macOS dice que no puede verificar el archivo | Cuarentena: clic derecho → Abrir → Abrir |
 | `Address already in use` al arrancar | El puerto 8765 ya está ocupado, probablemente por otra copia del servidor corriendo. Cerrala: `pkill -f "python3 app.py"` |
+| El `.venv` dejó de andar después de mover la carpeta | Los venv guardan rutas absolutas: `rm -rf .venv` y repetí el Paso 3 desde la ubicación nueva |
 | La app dice "No encontré whisperx" | El Paso 3 no terminó bien. Verificá que exista `.venv/bin/whisperx` y que el `.venv` esté **dentro de esta carpeta** |
 | `whisperx` instala pero explota al correr | Casi siempre es la versión de Python. Confirmá `.venv/bin/python -V` → tiene que decir 3.12.x. Si dice 3.13, borrá el `.venv` y repetí el Paso 3 con `--python 3.12` |
 | El modo IA falla al bajar el audio | Falta `ffmpeg`: `brew install ffmpeg` |
-| YouTube responde que se espere | Demasiados pedidos seguidos. No es un bug: esperar un minuto |
+| YouTube responde que se espere | Un 429. En el uso normal se pasa esperando un minuto. **Durante la instalación no lo despaches**: seguí el procedimiento del Paso 5.4 |
+| El navegador no se abre solo con doble clic | Cuarentena sin limpiar: repetí el Paso 4 con `xattr -dr` sobre la carpeta entera |
+| Un solo test falla, el del nieto | Es inestable por timing. Corré los tests de nuevo; ver Paso 5.2 |
 
 Las transcripciones y subtítulos se cachean en `~/.cache/buscar-en-video/`; los modelos de
 IA en `~/.cache/huggingface/` y `~/.cache/torch/`. Se pueden borrar en cualquier momento,
